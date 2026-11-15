@@ -9,6 +9,7 @@ Este módulo contém funções para:
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.metadata
 import os
@@ -23,7 +24,7 @@ from .search import SearchToolError, get_provider
 from .utils import _user_stacklevel
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator
+    from collections.abc import Awaitable, Callable, Iterable, Iterator
 
     from pydantic import ValidationError
 
@@ -1102,6 +1103,51 @@ def _usage_limit_error(error: Exception) -> ProviderUsageLimitError | None:
 _MAX_BACKOFF_EXPONENT = 1023
 
 
+def _retry_delay(
+    error: Exception,
+    attempt: int,
+    max_retries: int,
+    base_delay: float,
+    max_delay: float,
+) -> float | None:
+    """Decide o que fazer com a falha da tentativa `attempt` (de 0) de uma linha.
+
+    Devolve a espera antes da tentativa seguinte, já com o aviso emitido, ou
+    None quando o erro deve subir como está. A cota de uso esgotada sobe como
+    ProviderUsageLimitError. É a regra comum a retry_with_backoff e a
+    aretry_with_backoff, que só diferem na forma de esperar.
+    """
+    usage_limit = _usage_limit_error(error)
+    if usage_limit is not None:
+        raise usage_limit from error
+    error_name = type(error).__name__
+
+    # Verificar se é erro não-recuperável
+    if not is_recoverable_error(error):
+        warnings.warn(
+            f"Erro não-recuperável detectado ({error_name}). Não será feito retry.",
+            stacklevel=_user_stacklevel(),
+        )
+        return None
+
+    # Última tentativa - não fazer mais retry
+    if attempt >= max_retries - 1:
+        return None
+
+    # Calcular delay com backoff exponencial
+    delay = min(base_delay * (2 ** min(attempt, _MAX_BACKOFF_EXPONENT)), max_delay)
+    jitter = random.uniform(0, 0.1) * delay  # noqa: S311 (jitter de espera, sem uso criptográfico)
+    total_delay = delay + jitter
+
+    # Warning informativo sobre o retry
+    warnings.warn(
+        f"Tentativa {attempt + 1}/{max_retries} falhou ({error_name}). "
+        f"Aguardando {total_delay:.1f}s antes de tentar novamente...",
+        stacklevel=_user_stacklevel(),
+    )
+    return total_delay
+
+
 def retry_with_backoff(
     func: Callable[[], dict[str, Any]],
     max_retries: int = 3,
@@ -1137,37 +1183,43 @@ def retry_with_backoff(
             # Parada deliberada: o aviso "Execução interrompida" a explica.
             raise
         except Exception as e:
-            usage_limit = _usage_limit_error(e)
-            if usage_limit is not None:
-                raise usage_limit from e
-            error_name = type(e).__name__
-
-            # Verificar se é erro não-recuperável
-            if not is_recoverable_error(e):
-                warnings.warn(
-                    f"Erro não-recuperável detectado ({error_name}). Não será feito retry.",
-                    stacklevel=_user_stacklevel(),
-                )
+            delay = _retry_delay(e, attempt, max_retries, base_delay, max_delay)
+            if delay is None:
                 raise
-
-            # Última tentativa - não fazer mais retry
-            if attempt >= max_retries - 1:
-                raise
-
-            # Calcular delay com backoff exponencial
-            delay = min(base_delay * (2 ** min(attempt, _MAX_BACKOFF_EXPONENT)), max_delay)
-            jitter = random.uniform(0, 0.1) * delay  # noqa: S311 (jitter de espera, sem uso criptográfico)
-            total_delay = delay + jitter
-
             retry_info["retries"] = attempt + 1
+            time.sleep(delay)
 
-            # Warning informativo sobre o retry
-            warnings.warn(
-                f"Tentativa {attempt + 1}/{max_retries} falhou ({error_name}). "
-                f"Aguardando {total_delay:.1f}s antes de tentar novamente...",
-                stacklevel=_user_stacklevel(),
-            )
+        attempt += 1
 
-            time.sleep(total_delay)
+
+async def aretry_with_backoff(
+    func: Callable[[], Awaitable[dict[str, Any]]],
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+) -> dict[str, Any]:
+    """Versão assíncrona de retry_with_backoff, com as mesmas regras e avisos.
+
+    Espera com `asyncio.sleep`, que devolve o event loop às outras linhas, em
+    vez de `time.sleep`, que o bloquearia (e que no Pyodide trava a página).
+    """
+    retry_info = {"retries": 0}
+
+    attempt = 0
+    while True:
+        try:
+            result = await func()
+            # Dentro do try: uma falha ao anotar o resultado também ganha nova tentativa.
+            result["_retry_info"] = retry_info
+            return result  # noqa: TRY300 (o else mudaria quais falhas são re-tentadas)
+        except ProviderAbortError:
+            # Parada deliberada: o aviso "Execução interrompida" a explica.
+            raise
+        except Exception as e:
+            delay = _retry_delay(e, attempt, max_retries, base_delay, max_delay)
+            if delay is None:
+                raise
+            retry_info["retries"] = attempt + 1
+            await asyncio.sleep(delay)
 
         attempt += 1

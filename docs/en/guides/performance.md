@@ -147,6 +147,47 @@ result = dataframeit(
 
 When the provider reports a failure that prevents any further row, such as an exhausted usage quota (`ProviderUsageLimitError`) or a terminated `codex` runtime (`ProviderAbortError`), execution stops dispatching rows, saves the checkpoint, and warns how many rows were left without status. The control columns stay in the output. When running again with `resume=True` processes only the pending rows, and what happens with `reprocess_columns`, is covered in [Failures that stop the run](../reference/exceptions.md#failures-that-stop-the-run).
 
+## Async Mode and Browser (Pyodide)
+
+`adataframeit` is the async version of `dataframeit`: it takes the same parameters, returns the same result, and runs without threads. The model is called with `ainvoke`, the `parallel_requests` rows in flight are coroutines in the same event loop, and the waits between attempts and `rate_limit_delay` use `asyncio.sleep`. It is the path for Pyodide, where starting a thread raises `RuntimeError` and `time.sleep` freezes the page.
+
+```python
+import asyncio
+from dataframeit import RowResult, adataframeit
+
+async def on_done(row: RowResult) -> None:
+    print(row.position, row.index, row.success)
+
+async def main():
+    return await adataframeit(
+        df,
+        Model,
+        PROMPT,
+        parallel_requests=5,
+        on_row_done=on_done,
+        batch_size=50,
+        checkpoint_path="checkpoint.parquet",
+    )
+
+result = asyncio.run(main())  # in Pyodide and Jupyter: result = await main()
+```
+
+Resume, checkpoint, error recording, and worker reduction on rate limits work as in `dataframeit`. `on_row_done` runs in the event loop, without concurrency with the recording of other rows, and can be a regular function or a coroutine, which is awaited before the same worker starts its next row. Cancelling the task counts as an interruption: the row in flight is left without status, the checkpoint is saved, and the same call with `resume=True` resumes from it.
+
+Only LangChain providers without web search have an async path: `provider='codex'`, `provider='claude_code'`, and `use_search=True` raise `ValueError`.
+
+In Pyodide:
+
+- `micropip` dependency resolution trips over the `uuid-utils` and `tenacity` pins of LangChain's dependencies. Install each package with `micropip.install(..., deps=False)`, pinning the versions by hand.
+- Google's SDK, which uses `httpx`, gets the response already decompressed by the browser's `fetch` and tries to decompress it again. Before the first call, turn off `httpx` decompression:
+
+```python
+import httpx
+from httpx._decoders import IdentityDecoder
+
+httpx.Response._get_content_decoder = lambda self: IdentityDecoder()
+```
+
 ## Token Tracking
 
 Monitor usage and costs with `track_tokens=True`:

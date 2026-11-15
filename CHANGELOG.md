@@ -9,6 +9,8 @@ e este projeto adere ao [Versionamento Semântico](https://semver.org/lang/pt-BR
 
 ### Adicionado
 
+- `adataframeit()`, a versão assíncrona de `dataframeit()`, com os mesmos parâmetros e o mesmo resultado, que roda sem threads, como no Pyodide. O modelo é chamado com `ainvoke`, as `parallel_requests` linhas em voo são corrotinas no event loop, e as esperas entre tentativas e o `rate_limit_delay` usam `asyncio.sleep`. A retomada, o checkpoint, o registro de erros, a redução de workers por rate limit e o `on_row_done`, que também pode ser uma corrotina, seguem `dataframeit()`; o cancelamento da tarefa grava o checkpoint como o Ctrl-C. `provider='codex'`, `provider='claude_code'` e `use_search=True` levantam `ValueError`. A validação, a preparação do DataFrame, o resumo final, as regras de nova tentativa e de correção da resposta recusada e o registro das linhas do laço sequencial ficam em funções comuns aos dois caminhos.
+
 - Teste de mutação de `errors.py` e `utils.py` com o `mutmut`, configurado no `pyproject.toml` e rodado pelo workflow `mutation.yml` toda segunda-feira e sob demanda, fora do CI do PR. Os mutantes que sobreviviam e mudavam o resultado viraram testes: cada padrão de texto que decide uma caixa de erro, o texto das mensagens de pacote ausente, os defaults de `retry_with_backoff` e os casos de `parse_json` sem bloco JSON. Os que não mudam o resultado ganharam `# pragma: no mutate` com o motivo (#212).
 
 - Um teste confere as permissões do `docs.yml`, que nenhum check de PR executa: o workflow só concede `contents: read`, o job `deploy` tem exatamente `pages: write` e `id-token: write`, e nenhum outro job escreve. O PR que mexer nelas reprova no job de testes, antes do merge (#268).

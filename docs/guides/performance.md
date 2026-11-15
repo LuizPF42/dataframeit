@@ -149,6 +149,47 @@ resultado = dataframeit(
 
 Quando o provider informa uma falha que impede qualquer linha seguinte, como a cota de uso esgotada (`ProviderUsageLimitError`) ou o runtime do `codex` encerrado (`ProviderAbortError`), a execução para de despachar linhas, grava o checkpoint e avisa quantas ficaram sem status. As colunas de controle ficam na saída. Em que casos rodar de novo com `resume=True` processa só as pendentes, e o que acontece com `reprocess_columns`, está em [Falhas que interrompem a execução](../reference/exceptions.md#falhas-que-interrompem-a-execucao).
 
+## Modo Assíncrono e Navegador (Pyodide)
+
+`adataframeit` é a versão assíncrona de `dataframeit`: recebe os mesmos parâmetros, devolve o mesmo resultado e roda sem threads. O modelo é chamado com `ainvoke`, as `parallel_requests` linhas em voo são corrotinas no mesmo event loop, e as esperas entre tentativas e o `rate_limit_delay` usam `asyncio.sleep`. É o caminho para o Pyodide, em que abrir uma thread levanta `RuntimeError` e `time.sleep` trava a página.
+
+```python
+import asyncio
+from dataframeit import RowResult, adataframeit
+
+async def ao_concluir(linha: RowResult) -> None:
+    print(linha.position, linha.index, linha.success)
+
+async def main():
+    return await adataframeit(
+        df,
+        Model,
+        PROMPT,
+        parallel_requests=5,
+        on_row_done=ao_concluir,
+        batch_size=50,
+        checkpoint_path="checkpoint.parquet",
+    )
+
+resultado = asyncio.run(main())  # no Pyodide e no Jupyter: resultado = await main()
+```
+
+Retomada, checkpoint, registro de erros e redução de workers por rate limit funcionam como em `dataframeit`. O `on_row_done` roda no event loop, sem concorrência com a gravação das outras linhas, e pode ser uma função comum ou uma corrotina, que é esperada antes de o mesmo worker começar a linha seguinte. Cancelar a tarefa conta como interrupção: a linha em voo fica sem status, o checkpoint é gravado, e a mesma chamada com `resume=True` retoma dele.
+
+Só os providers do LangChain sem busca web têm caminho assíncrono: `provider='codex'`, `provider='claude_code'` e `use_search=True` levantam `ValueError`.
+
+No Pyodide:
+
+- A resolução de dependências do `micropip` esbarra nos pins de `uuid-utils` e `tenacity` das dependências do LangChain. Instale cada pacote com `micropip.install(..., deps=False)`, com as versões fixadas à mão.
+- O SDK do Google, que usa o `httpx`, recebe do `fetch` do navegador a resposta já descomprimida e tenta descomprimi-la de novo. Antes da primeira chamada, desligue a descompressão do `httpx`:
+
+```python
+import httpx
+from httpx._decoders import IdentityDecoder
+
+httpx.Response._get_content_decoder = lambda self: IdentityDecoder()
+```
+
 ## Tracking de Tokens
 
 Monitore uso e custos com `track_tokens=True`:

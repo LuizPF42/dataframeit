@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import collections.abc
 import dataclasses
 import datetime as dt
 import hashlib
 import importlib.util
+import inspect
 import itertools
 import json
 import logging
@@ -74,6 +76,7 @@ from .llm import (
     SearchConfig,
     SearchGroupConfig,
     _BuildOnce,
+    acall_langchain,
     build_structured_llm,
     call_langchain,
     with_shared_chat_model,
@@ -109,6 +112,7 @@ from .utils import (
 if TYPE_CHECKING:
     import os
     from collections.abc import (
+        Awaitable,
         Callable,
         Collection,
         Container,
@@ -307,7 +311,12 @@ def _notify_row_done(on_row_done: Callable[[RowResult], None] | None, result: Ro
     try:
         on_row_done(result)
     except Exception as e:  # noqa: BLE001 (o callback é do usuário; a falha dele não para a execução)
-        warnings.warn(f"on_row_done falhou na linha {result.index}: {_error_text(e)}", stacklevel=1)
+        _warn_row_done_failed(result, e)
+
+
+def _warn_row_done_failed(result: RowResult, error: Exception) -> None:
+    """Avisa da falha de on_row_done, que não para a execução."""
+    warnings.warn(f"on_row_done falhou na linha {result.index}: {_error_text(error)}", stacklevel=1)
 
 
 # Detalhe gravado na linha cujo texto está vazio, e que por isso não vai ao LLM.
@@ -378,7 +387,7 @@ def _warn_missing_texts(df: pd.DataFrame, text_column: str, rows: list[Hashable]
             f"{missing} linha(s) sem texto não vão ao LLM e ficam com status 'error' "
             f"('{_MISSING_TEXT_DETAIL}').",
             UserWarning,
-            stacklevel=3,
+            stacklevel=_user_stacklevel(),
         )
 
 
@@ -1037,7 +1046,7 @@ def _warn_search_rate_limit(  # noqa: PLR0913 (configuração de busca da execu�
         + "."
     )
 
-    warnings.warn(msg, UserWarning, stacklevel=3)
+    warnings.warn(msg, UserWarning, stacklevel=_user_stacklevel())
 
 
 def _validate_search_overrides(
@@ -1397,7 +1406,7 @@ def dataframeit(
 ) -> PolarsDataFrame: ...
 
 
-def dataframeit(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 (API pública: cada parâmetro é uma opção documentada)
+def dataframeit(  # noqa: PLR0913, PLR0917 (API pública: cada parâmetro é uma opção documentada)
     data: pd.DataFrame | pd.Series | PolarsDataFrame | PolarsSeries | list[Any] | dict[Any, Any],
     questions: type[BaseModel] | None = None,
     prompt: str | None = None,
@@ -1567,12 +1576,286 @@ def dataframeit(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 (API pública
         ValueError: Se parâmetros obrigatórios faltarem.
         TypeError: Se tipo de dados não for suportado.
     """
+    run = _prepare_run(
+        data,
+        questions=questions,
+        prompt=prompt,
+        perguntas=perguntas,
+        resume=resume,
+        reprocess_columns=reprocess_columns,
+        model=model,
+        provider=provider,
+        status_column=status_column,
+        text_column=text_column,
+        api_key=api_key,
+        max_retries=max_retries,
+        base_delay=base_delay,
+        max_delay=max_delay,
+        rate_limit_delay=rate_limit_delay,
+        track_tokens=track_tokens,
+        model_kwargs=model_kwargs,
+        parallel_requests=parallel_requests,
+        use_search=use_search,
+        search_provider=search_provider,
+        search_per_field=search_per_field,
+        max_results=max_results,
+        search_depth=search_depth,
+        max_search_calls=max_search_calls,
+        search_groups=search_groups,
+        save_trace=save_trace,
+        batch_size=batch_size,
+        checkpoint_path=checkpoint_path,
+    )
+    if not isinstance(run, _Run):
+        return run
+
+    # Entrar no backend conclui o preflight antes de qualquer mutação do DataFrame.
+    with _provider_backend(run.config, run.questions, run.prompt, run.trace_mode) as backend:
+        to_process, processed_count = _prepare_frame(run)
+        if run.parallel_requests > 1:
+            token_stats = _process_rows_parallel(
+                run.df,
+                backend=backend,
+                to_process=to_process,
+                processed_count=processed_count,
+                parallel_requests=run.parallel_requests,
+                on_row_done=on_row_done,
+                **run.rows_kwargs(),
+            )
+        else:
+            token_stats = _process_rows(
+                run.df,
+                backend=backend,
+                to_process=to_process,
+                processed_count=processed_count,
+                on_row_done=on_row_done,
+                **run.rows_kwargs(),
+            )
+    return _finish_run(run, token_stats)
+
+
+@overload
+async def adataframeit(
+    data: pd.DataFrame | pd.Series | list[Any] | dict[Any, Any],
+    questions: type[BaseModel] | None = None,
+    prompt: str | None = None,
+    perguntas: type[BaseModel] | None = None,  # Deprecated: use 'questions'
+    resume: bool = True,  # noqa: FBT001, FBT002 (posicional na API pública)
+    reprocess_columns: str | list[str] | tuple[str, ...] | None = None,
+    model: str | None = None,
+    provider: str = "openai",
+    status_column: str | None = None,
+    text_column: str | None = None,
+    api_key: str | None = None,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    rate_limit_delay: float = 0.0,
+    track_tokens: bool = True,  # noqa: FBT001, FBT002 (posicional na API pública)
+    model_kwargs: dict[str, Any] | None = None,
+    parallel_requests: int = 1,
+    # Parâmetros de busca web
+    use_search: bool = False,  # noqa: FBT001, FBT002 (posicional na API pública)
+    search_provider: str = "tavily",
+    search_per_field: bool = False,  # noqa: FBT001, FBT002 (posicional na API pública)
+    max_results: int = 5,
+    search_depth: str = "basic",
+    max_search_calls: int = 10,
+    search_groups: dict[str, dict[str, Any]] | None = None,
+    save_trace: bool | Literal["full", "minimal"] | None = None,  # noqa: FBT001 (posicional na API pública)
+    batch_size: int | None = None,
+    checkpoint_path: str | os.PathLike[str] | None = None,
+    on_row_done: Callable[[RowResult], Awaitable[None] | None] | None = None,
+) -> pd.DataFrame: ...
+
+
+@overload
+async def adataframeit(
+    data: PolarsDataFrame | PolarsSeries,
+    questions: type[BaseModel] | None = None,
+    prompt: str | None = None,
+    perguntas: type[BaseModel] | None = None,  # Deprecated: use 'questions'
+    resume: bool = True,  # noqa: FBT001, FBT002 (posicional na API pública)
+    reprocess_columns: str | list[str] | tuple[str, ...] | None = None,
+    model: str | None = None,
+    provider: str = "openai",
+    status_column: str | None = None,
+    text_column: str | None = None,
+    api_key: str | None = None,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    rate_limit_delay: float = 0.0,
+    track_tokens: bool = True,  # noqa: FBT001, FBT002 (posicional na API pública)
+    model_kwargs: dict[str, Any] | None = None,
+    parallel_requests: int = 1,
+    # Parâmetros de busca web
+    use_search: bool = False,  # noqa: FBT001, FBT002 (posicional na API pública)
+    search_provider: str = "tavily",
+    search_per_field: bool = False,  # noqa: FBT001, FBT002 (posicional na API pública)
+    max_results: int = 5,
+    search_depth: str = "basic",
+    max_search_calls: int = 10,
+    search_groups: dict[str, dict[str, Any]] | None = None,
+    save_trace: bool | Literal["full", "minimal"] | None = None,  # noqa: FBT001 (posicional na API pública)
+    batch_size: int | None = None,
+    checkpoint_path: str | os.PathLike[str] | None = None,
+    on_row_done: Callable[[RowResult], Awaitable[None] | None] | None = None,
+) -> PolarsDataFrame: ...
+
+
+async def adataframeit(  # noqa: PLR0913, PLR0917 (API pública: os parâmetros de dataframeit)
+    data: pd.DataFrame | pd.Series | PolarsDataFrame | PolarsSeries | list[Any] | dict[Any, Any],
+    questions: type[BaseModel] | None = None,
+    prompt: str | None = None,
+    perguntas: type[BaseModel] | None = None,  # Deprecated: use 'questions'
+    resume: bool = True,  # noqa: FBT001, FBT002 (posicional na API pública)
+    reprocess_columns: str | list[str] | tuple[str, ...] | None = None,
+    model: str | None = None,
+    provider: str = "openai",
+    status_column: str | None = None,
+    text_column: str | None = None,
+    api_key: str | None = None,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    rate_limit_delay: float = 0.0,
+    track_tokens: bool = True,  # noqa: FBT001, FBT002 (posicional na API pública)
+    model_kwargs: dict[str, Any] | None = None,
+    parallel_requests: int = 1,
+    # Parâmetros de busca web
+    use_search: bool = False,  # noqa: FBT001, FBT002 (posicional na API pública)
+    search_provider: str = "tavily",
+    search_per_field: bool = False,  # noqa: FBT001, FBT002 (posicional na API pública)
+    max_results: int = 5,
+    search_depth: str = "basic",
+    max_search_calls: int = 10,
+    search_groups: dict[str, dict[str, Any]] | None = None,
+    save_trace: bool | Literal["full", "minimal"] | None = None,  # noqa: FBT001 (posicional na API pública)
+    batch_size: int | None = None,
+    checkpoint_path: str | os.PathLike[str] | None = None,
+    on_row_done: Callable[[RowResult], Awaitable[None] | None] | None = None,
+) -> pd.DataFrame | PolarsDataFrame:
+    """Versão assíncrona de dataframeit, que roda sem threads, como no Pyodide.
+
+    Recebe os mesmos parâmetros e devolve o mesmo resultado que `dataframeit`,
+    com a mesma validação, retomada (`resume`, `checkpoint_path`), registro de
+    erros, avisos e resumo de uso. Muda a forma de esperar:
+
+    - o modelo é chamado com `ainvoke` do LangChain, que não abre thread;
+    - até `parallel_requests` linhas ficam em voo ao mesmo tempo no event
+      loop, em corrotinas, e não em threads; a redução por rate limit vale
+      como no modo paralelo;
+    - as esperas entre tentativas e o `rate_limit_delay` usam `asyncio.sleep`,
+      que não bloqueia o event loop.
+
+    `on_row_done` recebe o mesmo `RowResult`, chamado no event loop, sem
+    concorrência com a gravação das outras linhas. Se devolver um awaitable
+    (função `async def`), ele é esperado antes de a linha seguinte do mesmo
+    worker começar. Uma exceção dentro dele vira aviso, e a execução segue.
+
+    O cancelamento da tarefa conta como interrupção, como o Ctrl-C em
+    `dataframeit`: a linha em voo não é registrada e fica sem status, o
+    checkpoint é gravado, e o `asyncio.CancelledError` segue.
+
+    Só os providers do LangChain sem busca web têm caminho assíncrono:
+    `provider='codex'`, `provider='claude_code'` e `use_search=True` levantam
+    ValueError antes de qualquer outra validação.
+
+    Exemplo: ``df = await adataframeit(df, Model, PROMPT, parallel_requests=5)``.
+    """
+    _check_async_support(provider, use_search=use_search)
+    run = _prepare_run(
+        data,
+        questions=questions,
+        prompt=prompt,
+        perguntas=perguntas,
+        resume=resume,
+        reprocess_columns=reprocess_columns,
+        model=model,
+        provider=provider,
+        status_column=status_column,
+        text_column=text_column,
+        api_key=api_key,
+        max_retries=max_retries,
+        base_delay=base_delay,
+        max_delay=max_delay,
+        rate_limit_delay=rate_limit_delay,
+        track_tokens=track_tokens,
+        model_kwargs=model_kwargs,
+        parallel_requests=parallel_requests,
+        use_search=use_search,
+        search_provider=search_provider,
+        search_per_field=search_per_field,
+        max_results=max_results,
+        search_depth=search_depth,
+        max_search_calls=max_search_calls,
+        search_groups=search_groups,
+        save_trace=save_trace,
+        batch_size=batch_size,
+        checkpoint_path=checkpoint_path,
+    )
+    if not isinstance(run, _Run):
+        return run
+
+    backend = _async_backend(run.config, run.questions, run.prompt)
+    to_process, processed_count = _prepare_frame(run)
+    token_stats = await _aprocess_rows(
+        run.df,
+        backend=backend,
+        to_process=to_process,
+        processed_count=processed_count,
+        parallel_requests=run.parallel_requests,
+        on_row_done=on_row_done,
+        **run.rows_kwargs(),
+    )
+    return _finish_run(run, token_stats)
+
+
+def _prepare_run(  # noqa: C901, PLR0912, PLR0913, PLR0915 (a validação de cada parâmetro da API pública)
+    data: pd.DataFrame | pd.Series | PolarsDataFrame | PolarsSeries | list[Any] | dict[Any, Any],
+    *,
+    questions: type[BaseModel] | None,
+    prompt: str | None,
+    perguntas: type[BaseModel] | None,
+    resume: bool,
+    reprocess_columns: str | list[str] | tuple[str, ...] | None,
+    model: str | None,
+    provider: str,
+    status_column: str | None,
+    text_column: str | None,
+    api_key: str | None,
+    max_retries: int,
+    base_delay: float,
+    max_delay: float,
+    rate_limit_delay: float,
+    track_tokens: bool,
+    model_kwargs: dict[str, Any] | None,
+    parallel_requests: int,
+    use_search: bool,
+    search_provider: str,
+    search_per_field: bool,
+    max_results: int,
+    search_depth: str,
+    max_search_calls: int,
+    search_groups: dict[str, dict[str, Any]] | None,
+    save_trace: bool | Literal["full", "minimal"] | None,
+    batch_size: int | None,
+    checkpoint_path: str | os.PathLike[str] | None,
+) -> _Run | pd.DataFrame | PolarsDataFrame:
+    """Valida a chamada e prepara a execução, comum a dataframeit e adataframeit.
+
+    Devolve o `_Run` da execução com linhas a processar ou, quando a resposta
+    não depende do provider (entrada vazia, checkpoint concluído, colunas já
+    existentes sem resume), o resultado final. Nada aqui chama o provider, e
+    os avisos apontam a chamada do usuário por `_user_stacklevel()`.
+    """
     # Compatibilidade com API antiga
     if questions is None and perguntas is not None:
         warnings.warn(
             "O parâmetro 'perguntas' está depreciado; use 'questions'.",
             DeprecationWarning,
-            stacklevel=2,
+            stacklevel=_user_stacklevel(),
         )
         questions = perguntas
     elif questions is None:
@@ -1686,7 +1969,7 @@ def dataframeit(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 (API pública
                         f"Múltiplas colunas candidatas encontradas: {matches}. "
                         f"Usando '{text_column}'. Passe text_column= para suprimir este aviso.",
                         UserWarning,
-                        stacklevel=2,
+                        stacklevel=_user_stacklevel(),
                     )
             elif len(df_pandas.columns) == 1:
                 text_column = df_pandas.columns[0]
@@ -1871,7 +2154,7 @@ def dataframeit(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 (API pública
             "execução não as preenche nelas: ficam com o padrão de cada campo, ou None. "
             f"Para preenchê-las, passe reprocess_columns={suggested_columns!r}.",
             UserWarning,
-            stacklevel=2,
+            stacklevel=_user_stacklevel(),
         )
 
     # Um checkpoint sem posição pendente não depende do provider nem de autenticação.
@@ -1953,87 +2236,131 @@ def dataframeit(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 (API pública
             )
     validate_provider_dependencies(provider)
 
-    # Entrar no backend conclui o preflight antes de qualquer mutação do DataFrame.
-    with _provider_backend(config, questions, prompt, trace_mode) as backend:
-        _setup_columns(
-            df_pandas,
-            expected_columns,
-            status_column,
-            track_tokens=track_tokens,
-            search_config=search_config,
-            trace_mode=trace_mode,
-            pydantic_model=questions,
-        )
-        control_columns = [status_col, "_error_details"]
-        _as_object_columns(df_pandas, expected_columns + control_columns, nan_columns)
-        # O ausente que chega como pd.NA nas colunas de controle, como o da
-        # coluna `string` de convert_dtypes, vira None: a marca das linhas não
-        # alcançadas compara o status e o detalhe com texto, e a comparação com
-        # o pd.NA não é booleana.
-        with _silent_slice_write(df_pandas):
-            for col in control_columns:
-                df_pandas[col] = df_pandas[col].where(df_pandas[col].notna(), None)
-        _apply_processed_values(df_pandas, processed_values)
+    return _Run(
+        df=df_pandas,
+        conversion_info=conversion_info,
+        annotations=annotations,
+        questions=questions,
+        prompt=prompt,
+        config=config,
+        trace_mode=trace_mode,
+        text_column=text_column,
+        status_column=status_column,
+        status_col=status_col,
+        expected_columns=expected_columns,
+        value_columns=value_columns,
+        nan_columns=nan_columns,
+        complex_fields=complex_fields,
+        processed_values=processed_values,
+        resume=resume,
+        reprocess_columns=reprocess_columns,
+        track_tokens=track_tokens,
+        parallel_requests=parallel_requests,
+        checkpoint=checkpoint,
+        search_provider=search_provider if use_search else None,
+    )
 
-        # Normalizar colunas complexas (listas, dicts, tuples) que podem ter sido
-        # serializadas como strings JSON ao salvar/carregar de arquivos.
-        if complex_fields and resume:
-            normalize_complex_columns(df_pandas, complex_fields)
 
-        # De novo depois da normalização, cujo apply volta a inferir float; sem
-        # isso, gravar lista ou texto falharia depois da chamada paga. A coluna
-        # de estrutura não guarda o NaN como valor, e `nan_columns` não muda nada.
-        _as_object_columns(df_pandas, expected_columns)
+@dataclass
+class _Run:
+    """A execução validada por _prepare_run, comum a dataframeit e adataframeit."""
 
-        to_process, processed_count = _get_processing_indices(
-            df_pandas, status_col, resume=resume, reprocess=bool(reprocess_columns)
-        )
-        _warn_missing_texts(
-            df_pandas,
-            text_column,
-            [idx for idx, chosen in zip(df_pandas.index, to_process, strict=True) if chosen],
-        )
+    df: pd.DataFrame
+    conversion_info: ConversionInfo
+    annotations: dict[str, Any]
+    questions: type[BaseModel]
+    prompt: str
+    config: LLMConfig
+    trace_mode: str | None
+    text_column: str
+    status_column: str | None
+    status_col: str
+    expected_columns: list[str]
+    value_columns: list[str]
+    nan_columns: frozenset[str]
+    complex_fields: set[str]
+    processed_values: dict[tuple[int, str], Any]
+    resume: bool
+    reprocess_columns: list[str] | tuple[str, ...] | None
+    track_tokens: bool
+    parallel_requests: int
+    checkpoint: _Checkpoint | None
+    # Provedor de busca, que dá nome à seção de busca do resumo; None sem busca.
+    search_provider: str | None
 
-        if parallel_requests > 1:
-            token_stats = _process_rows_parallel(
-                df_pandas,
-                text_column=text_column,
-                status_col=status_col,
-                expected_columns=expected_columns,
-                nan_columns=nan_columns,
-                value_columns=value_columns,
-                config=config,
-                backend=backend,
-                to_process=to_process,
-                processed_count=processed_count,
-                conversion_info=conversion_info,
-                track_tokens=track_tokens,
-                reprocess_columns=reprocess_columns,
-                parallel_requests=parallel_requests,
-                trace_mode=trace_mode,
-                checkpoint=checkpoint,
-                on_row_done=on_row_done,
-            )
-        else:
-            token_stats = _process_rows(
-                df_pandas,
-                text_column=text_column,
-                status_col=status_col,
-                expected_columns=expected_columns,
-                nan_columns=nan_columns,
-                value_columns=value_columns,
-                config=config,
-                backend=backend,
-                to_process=to_process,
-                processed_count=processed_count,
-                conversion_info=conversion_info,
-                track_tokens=track_tokens,
-                reprocess_columns=reprocess_columns,
-                trace_mode=trace_mode,
-                checkpoint=checkpoint,
-                on_row_done=on_row_done,
-            )
+    def rows_kwargs(self) -> dict[str, Any]:
+        """Os parâmetros que os laços de linhas recebem da execução."""
+        return {
+            "text_column": self.text_column,
+            "status_col": self.status_col,
+            "expected_columns": self.expected_columns,
+            "nan_columns": self.nan_columns,
+            "value_columns": self.value_columns,
+            "config": self.config,
+            "conversion_info": self.conversion_info,
+            "track_tokens": self.track_tokens,
+            "reprocess_columns": self.reprocess_columns,
+            "trace_mode": self.trace_mode,
+            "checkpoint": self.checkpoint,
+        }
 
+
+def _prepare_frame(run: _Run) -> tuple[list[bool], int]:
+    """Cria e converte as colunas da execução e escolhe as linhas a processar.
+
+    Roda com o backend já pronto, para que uma falha de preflight não deixe o
+    DataFrame alterado. Devolve as linhas a processar, por posição, e quantas
+    já tinham status.
+    """
+    df_pandas = run.df
+    expected_columns = run.expected_columns
+    status_col = run.status_col
+    _setup_columns(
+        df_pandas,
+        expected_columns,
+        run.status_column,
+        track_tokens=run.track_tokens,
+        search_config=run.config.search_config,
+        trace_mode=run.trace_mode,
+        pydantic_model=run.questions,
+    )
+    control_columns = [status_col, "_error_details"]
+    _as_object_columns(df_pandas, expected_columns + control_columns, run.nan_columns)
+    # O ausente que chega como pd.NA nas colunas de controle, como o da
+    # coluna `string` de convert_dtypes, vira None: a marca das linhas não
+    # alcançadas compara o status e o detalhe com texto, e a comparação com
+    # o pd.NA não é booleana.
+    with _silent_slice_write(df_pandas):
+        for col in control_columns:
+            df_pandas[col] = df_pandas[col].where(df_pandas[col].notna(), None)
+    _apply_processed_values(df_pandas, run.processed_values)
+
+    # Normalizar colunas complexas (listas, dicts, tuples) que podem ter sido
+    # serializadas como strings JSON ao salvar/carregar de arquivos.
+    if run.complex_fields and run.resume:
+        normalize_complex_columns(df_pandas, run.complex_fields)
+
+    # De novo depois da normalização, cujo apply volta a inferir float; sem
+    # isso, gravar lista ou texto falharia depois da chamada paga. A coluna
+    # de estrutura não guarda o NaN como valor, e `nan_columns` não muda nada.
+    _as_object_columns(df_pandas, expected_columns)
+
+    to_process, processed_count = _get_processing_indices(
+        df_pandas, status_col, resume=run.resume, reprocess=bool(run.reprocess_columns)
+    )
+    _warn_missing_texts(
+        df_pandas,
+        run.text_column,
+        [idx for idx, chosen in zip(df_pandas.index, to_process, strict=True) if chosen],
+    )
+    return to_process, processed_count
+
+
+def _finish_run(run: _Run, token_stats: TokenStats) -> pd.DataFrame | PolarsDataFrame:
+    """Avisa da interrupção e da redução de workers, registra o resumo e devolve o resultado."""
+    df_pandas = run.df
+    status_col = run.status_col
+    conversion_info = run.conversion_info
     if token_stats.get("abort"):
         pending = int(df_pandas[status_col].isna().sum())
         kept = int(df_pandas["_error_details"].eq(_INTERRUPTED_REPROCESS_DETAIL).sum())
@@ -2051,7 +2378,7 @@ def dataframeit(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 (API pública
             ORIGINAL_TYPE_PANDAS_DF,
             ORIGINAL_TYPE_POLARS_DF,
         )
-        if checkpoint is not None:
+        if run.checkpoint is not None:
             how = "rode de novo com o mesmo checkpoint_path"
             if output_has_text:
                 how += ", ou com resume=True sobre esta saída"
@@ -2066,15 +2393,15 @@ def dataframeit(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 (API pública
             f"Execução interrompida: {token_stats['abort'].rstrip('.')}. {summary}. "
             f"Para retomar, {how}.",
             UserWarning,
-            stacklevel=2,
+            stacklevel=_user_stacklevel(),
         )
 
-    if track_tokens and any(token_stats.values()):
+    if run.track_tokens and any(token_stats.values()):
         summary_text = _format_token_stats(
             token_stats,
-            model,
-            parallel_requests,
-            search_provider=search_provider if use_search else None,
+            run.config.model,
+            run.parallel_requests,
+            search_provider=run.search_provider,
         )
         if summary_text:
             _stats_logger.info("%s", summary_text)
@@ -2086,11 +2413,11 @@ def dataframeit(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 (API pública
             f"{token_stats['final_workers']}. Considere usar "
             f"parallel_requests={token_stats['final_workers']} para evitar rate limits.",
             UserWarning,
-            stacklevel=2,
+            stacklevel=_user_stacklevel(),
         )
 
     # Retornar no formato original (remove colunas de status/erro se não houver erros)
-    return from_pandas(df_pandas, conversion_info, status_col, annotations)
+    return from_pandas(df_pandas, conversion_info, status_col, run.annotations)
 
 
 def _setup_columns(  # noqa: C901, PLR0912, PLR0913 (uma família de colunas por recurso ligado)
@@ -3132,7 +3459,7 @@ def _resume_from_checkpoint(  # noqa: PLR0913 (a entrada, o checkpoint e a confi
             "sobrescreve. Para retomá-lo mesmo assim, carregue-o com read_df e "
             "passe-o como entrada.",
             UserWarning,
-            stacklevel=3,
+            stacklevel=_user_stacklevel(),
         )
         return frozenset()
 
@@ -3731,7 +4058,7 @@ def _record_unrecorded_error(
 
 def _progress_description(
     config: LLMConfig,
-    backend: ProviderBackend,
+    backend: ProviderBackend | _AsyncBackend,
     conversion_info: ConversionInfo,
     workers_label: str,
 ) -> str:
@@ -3756,7 +4083,80 @@ def _progress_suffix(
     return ""
 
 
-def _process_rows(  # noqa: C901, PLR0913, PLR0915 (estado da execução repassado por dataframeit, e um ramo por desfecho da linha)
+def _sequential_description(
+    config: LLMConfig, backend: ProviderBackend | _AsyncBackend, conversion_info: ConversionInfo
+) -> str:
+    """Rótulo da barra com um worker: sem contagem de workers, com o teto de req/min."""
+    desc = _progress_description(config, backend, conversion_info, "")
+    # Adicionar info de rate limiting (se ativo)
+    if config.rate_limit_delay > 0:
+        req_per_min = int(60 / config.rate_limit_delay)
+        desc += f" [~{req_per_min} req/min]"
+    return desc
+
+
+def _row_already_processed(row: pd.Series, status_col: str) -> bool:
+    """Se a linha chega 'processed', caso em que reprocess_columns limita o que ela grava."""
+    return bool(pd.notna(row[status_col]) and row[status_col] == "processed")
+
+
+class _RowLedger:
+    """As linhas que um laço sem threads registrou nesta execução, e o checkpoint delas.
+
+    Serve ao laço sequencial de dataframeit e ao de adataframeit. Em nenhum dos
+    dois outra linha é gravada durante a gravação do checkpoint, e ela leva o
+    próprio DataFrame, sem a cópia do modo paralelo com threads. A linha
+    registrada já está gravada no DataFrame; o abort e a interrupção marcam as
+    demais pela mesma definição (`_mark_unreached`).
+    """
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        checkpoint: _Checkpoint | None,
+        mark_unreached: Callable[[Container[Hashable]], bool],
+    ) -> None:
+        self.df = df
+        self.checkpoint = checkpoint
+        self._mark_unreached = mark_unreached
+        self.registered: set[Hashable] = set()
+        self.count = 0
+        self.saved = 0
+        # Se as marcas da interrupção mudaram o DataFrame, e a gravação deve levá-las.
+        self.marked = False
+
+    def register(self, idx: Hashable) -> bool:
+        """Registra a linha gravada e diz se ela completa um lote do checkpoint."""
+        self.registered.add(idx)
+        self.count += 1
+        return self.checkpoint is not None and self.count % self.checkpoint.batch_size == 0
+
+    def save(self, *, also: bool = False) -> None:
+        """Grava o checkpoint se há linha registrada fora dele, ou com `also`.
+
+        `also` leva ao arquivo o que não conta linha, como as marcas de uma
+        interrupção. A falha de gravação vira aviso em _try_save_checkpoint, e a
+        próxima gravação tenta de novo com o estado completo.
+        """
+        if (
+            self.checkpoint is not None
+            and (self.count > self.saved or also)
+            and _try_save_checkpoint(self.df, self.checkpoint)
+        ):
+            self.saved = self.count
+
+    def mark(self) -> bool:
+        """Marca as linhas que a execução ia processar e não registrou; diz se alguma mudou."""
+        return self._mark_unreached(self.registered)
+
+    def mark_on_interrupt(self) -> None:
+        """Marca a linha cuja chamada a interrupção cortou e as seguintes."""
+        # Uma segunda interrupção que corte as marcas ainda grava as que entraram.
+        self.marked = True
+        self.marked = self.mark()
+
+
+def _process_rows(  # noqa: C901, PLR0913 (estado da execução repassado por dataframeit, e um ramo por desfecho da linha)
     df: pd.DataFrame,
     *,
     text_column: str,
@@ -3798,35 +4198,28 @@ def _process_rows(  # noqa: C901, PLR0913, PLR0915 (estado da execução repassa
     Returns:
         Dict com estatísticas de tokens: {'input_tokens', 'output_tokens', 'total_tokens'}
     """
-    desc = _progress_description(config, backend, conversion_info, "")
-
-    # Adicionar info de rate limiting (se ativo)
-    if config.rate_limit_delay > 0:
-        req_per_min = int(60 / config.rate_limit_delay)
-        desc += f" [~{req_per_min} req/min]"
+    desc = _sequential_description(config, backend, conversion_info)
     desc += _progress_suffix(df, reprocess_columns, processed_count)
 
     token_stats = _empty_token_stats()
-    rows_processed_this_run = 0
-    rows_saved = 0
     # Linhas registradas nesta execução; o abort e o Ctrl-C marcam as demais.
-    registered: set[Hashable] = set()
-    # Se as marcas do Ctrl-C mudaram o DataFrame, e a gravação deve levá-las.
-    marked = False
-    mark_unreached = partial(
-        _mark_unreached,
+    ledger = _RowLedger(
         df,
-        to_process=to_process,
-        status_col=status_col,
-        reprocess_columns=reprocess_columns,
-        value_columns=value_columns,
-        nan_columns=nan_columns,
+        checkpoint,
+        partial(
+            _mark_unreached,
+            df,
+            to_process=to_process,
+            status_col=status_col,
+            reprocess_columns=reprocess_columns,
+            value_columns=value_columns,
+            nan_columns=nan_columns,
+        ),
     )
 
     def process_row(idx: Hashable, row: pd.Series) -> tuple[bool, dict[str, Any]]:
         """Registra o desfecho da linha e devolve se a chamada deu certo e os campos gravados."""
-        # Verificar se linha já foi processada
-        row_already_processed = pd.notna(row[status_col]) and row[status_col] == "processed"
+        row_already_processed = _row_already_processed(row, status_col)
 
         success = False
         values: dict[str, Any] = {}
@@ -3865,7 +4258,7 @@ def _process_rows(  # noqa: C901, PLR0913, PLR0915 (estado da execução repassa
             except ProviderAbortError as e:
                 token_stats["abort"] = _abort_reason(e)
                 _add_failed_usage(token_stats, e)
-                mark_unreached(registered)
+                ledger.mark()
             except Exception as e:  # noqa: BLE001 (qualquer falha da linha vira status 'error')
                 _record_error_safely(
                     df,
@@ -3879,19 +4272,9 @@ def _process_rows(  # noqa: C901, PLR0913, PLR0915 (estado da execução repassa
                 )
         return success, values
 
-    def mark_unreached_on_ctrl_c() -> None:
-        """Marca a linha cuja chamada o Ctrl-C cortou e as seguintes."""
-        nonlocal marked
-        # Um segundo Ctrl-C que corte as marcas ainda grava as que entraram.
-        marked = True
-        marked = mark_unreached(registered)
-
     def save_on_ctrl_c() -> None:
         """Grava as linhas registradas e as marcas do Ctrl-C que a última gravação não levou."""
-        if checkpoint and (
-            rows_processed_this_run > rows_saved or token_stats.get("abort") or marked
-        ):
-            _try_save_checkpoint(df, checkpoint)
+        ledger.save(also=bool(token_stats.get("abort")) or ledger.marked)
 
     # Ctrl-C: grava as linhas registradas desde a última gravação, que a
     # retomada pagaria de novo, e relança a interrupção. A linha cuja chamada
@@ -3899,7 +4282,7 @@ def _process_rows(  # noqa: C901, PLR0913, PLR0915 (estado da execução repassa
     # como na interrupção por ProviderAbortError, e as marcas também vão ao
     # arquivo. O Ctrl-C que corta a gravação final a refaz. A falha de gravação
     # vira aviso em _try_save_checkpoint e não troca a interrupção.
-    with _on_ctrl_c(mark_unreached_on_ctrl_c, save_on_ctrl_c):
+    with _on_ctrl_c(ledger.mark_on_interrupt, save_on_ctrl_c):
         rows = tqdm(df.iterrows(), total=len(df), desc=desc)
         for (idx, row), chosen in zip(rows, to_process, strict=True):
             if not chosen:
@@ -3908,12 +4291,11 @@ def _process_rows(  # noqa: C901, PLR0913, PLR0915 (estado da execução repassa
             success, values = process_row(idx, row)
             if "abort" in token_stats:
                 break
-            registered.add(idx)
 
             # A linha conta antes do callback: um Ctrl-C dentro dele chega com a
             # linha já gravada no DataFrame, e a gravação do Ctrl-C a leva.
-            position = rows_processed_this_run
-            rows_processed_this_run += 1
+            position = ledger.count
+            save_due = ledger.register(idx)
             _notify_row_done(
                 on_row_done,
                 RowResult(
@@ -3925,35 +4307,34 @@ def _process_rows(  # noqa: C901, PLR0913, PLR0915 (estado da execução repassa
                     elapsed_seconds=time.monotonic() - started,
                 ),
             )
-            if (
-                checkpoint
-                and rows_processed_this_run % checkpoint.batch_size == 0
-                and _try_save_checkpoint(df, checkpoint)
-            ):
-                rows_saved = rows_processed_this_run
+            if save_due:
+                ledger.save()
 
             if success and config.rate_limit_delay > 0:
                 time.sleep(config.rate_limit_delay)
 
         # Save final: a cauda (< batch_size), o que uma gravação que falhou deixou de
         # fora e as marcas de uma interrupção, que não contam como linha processada.
-        if checkpoint and (rows_processed_this_run > rows_saved or token_stats.get("abort")):
-            _try_save_checkpoint(df, checkpoint)
+        ledger.save(also=bool(token_stats.get("abort")))
 
     return token_stats
 
 
 @contextmanager
 def _on_ctrl_c(
-    mark: Callable[[], object], save: Callable[[], object]
+    mark: Callable[[], object],
+    save: Callable[[], object],
+    interruptions: tuple[type[BaseException], ...] = (KeyboardInterrupt,),
 ) -> Generator[None, None, None]:
-    """Chama `mark` e `save` quando um KeyboardInterrupt atravessa o bloco, e o relança.
+    """Chama `mark` e `save` quando uma interrupção atravessa o bloco, e a relança.
 
-    `save` roda também quando um segundo Ctrl-C corta `mark`.
+    A interrupção é o KeyboardInterrupt e, no laço assíncrono, também o
+    cancelamento da tarefa. `save` roda também quando um segundo Ctrl-C corta
+    `mark`.
     """
     try:
         yield
-    except KeyboardInterrupt:
+    except interruptions:
         try:
             mark()
         finally:
@@ -4005,6 +4386,35 @@ def _closing_in_slices(max_workers: int) -> Generator[ThreadPoolExecutor, None, 
             if thread.name.startswith(f"{prefix}_") and thread.is_alive()
         ]:
             alive[0].join(_WAIT_SLICE_SECONDS)
+
+
+# Depois de uma redução por rate limit, cada linha que começa nos próximos
+# _RATE_LIMIT_WINDOW_SECONDS segundos pausa _RATE_LIMIT_PAUSE_SECONDS antes de
+# chamar o provider.
+_RATE_LIMIT_PAUSE_SECONDS = 2.0
+_RATE_LIMIT_WINDOW_SECONDS = 5.0
+
+
+def _is_rate_limit_safely(error: Exception) -> bool:
+    """is_rate_limit_error, com False quando a classificação levanta.
+
+    A classificação lê o texto da exceção; se ele não puder ser montado, a
+    linha segue para o registro, que tem o próprio recurso.
+    """
+    try:
+        return is_rate_limit_error(error)
+    except Exception:  # noqa: BLE001 (ver a docstring)
+        return False
+
+
+def _halved_workers(current_workers: int) -> int:
+    """Teto de linhas em voo depois de um rate limit: a metade, com aviso."""
+    reduced = max(1, current_workers // 2)
+    warnings.warn(
+        f"Rate limit detectado! Reduzindo workers de {current_workers} para {reduced}.",
+        stacklevel=3,
+    )
+    return reduced
 
 
 def _process_rows_parallel(  # noqa: C901, PLR0913, PLR0915 (estado compartilhado entre threads)
@@ -4150,7 +4560,7 @@ def _process_rows_parallel(  # noqa: C901, PLR0913, PLR0915 (estado compartilhad
 
         started = time.monotonic()
         _position, idx, row = row_data
-        row_already_processed = pd.notna(row[status_col]) and row[status_col] == "processed"
+        row_already_processed = _row_already_processed(row, status_col)
         if _is_missing_text(row[text_column]):
             with lock:
                 _record_missing_text(
@@ -4172,7 +4582,7 @@ def _process_rows_parallel(  # noqa: C901, PLR0913, PLR0915 (estado compartilhad
 
         # Verificar se devemos pausar devido a rate limit
         if rate_limit_event.is_set():
-            time.sleep(2.0)  # Pausa breve quando rate limit detectado
+            time.sleep(_RATE_LIMIT_PAUSE_SECONDS)
 
         try:
             result = _invoke_row(
@@ -4210,25 +4620,14 @@ def _process_rows_parallel(  # noqa: C901, PLR0913, PLR0915 (estado compartilhad
             abort_event.set()
             return
         except Exception as e:  # noqa: BLE001 (qualquer falha da linha vira status 'error')
-            # A classificação lê o texto da exceção; se ele não puder ser montado,
-            # a linha segue para o registro, que tem o próprio recurso.
-            try:
-                rate_limited = is_rate_limit_error(e)
-            except Exception:  # noqa: BLE001 (ver o comentário acima)
-                rate_limited = False
-            if rate_limited:
+            if _is_rate_limit_safely(e):
                 with lock:
                     if current_workers > 1:
-                        old_workers = current_workers
-                        current_workers = max(1, current_workers // 2)
+                        current_workers = _halved_workers(current_workers)
                         workers_reduced = True
-                        warnings.warn(
-                            f"Rate limit detectado! Reduzindo workers de {old_workers} para {current_workers}.",
-                            stacklevel=2,
-                        )
                         rate_limit_event.set()
                         # Limpar evento após um tempo
-                        threading.Timer(5.0, rate_limit_event.clear).start()
+                        threading.Timer(_RATE_LIMIT_WINDOW_SECONDS, rate_limit_event.clear).start()
 
             with lock:
                 _record_error_safely(
@@ -4368,4 +4767,286 @@ def _process_rows_parallel(  # noqa: C901, PLR0913, PLR0915 (estado compartilhad
     token_stats["final_workers"] = current_workers
     token_stats["workers_reduced"] = workers_reduced
 
+    return token_stats
+
+
+# Providers que rodam num subprocesso local, sem caminho assíncrono.
+_SUBPROCESS_PROVIDERS = frozenset({"codex", "claude_code"})
+
+
+def _check_async_support(provider: str, *, use_search: bool) -> None:
+    """Recusa em adataframeit, antes de qualquer validação, o que só roda com threads ou subprocesso."""
+    if provider in _SUBPROCESS_PROVIDERS:
+        msg = (
+            f"adataframeit não suporta provider='{provider}', que roda num subprocesso "
+            "local. Use dataframeit() ou um provider do LangChain, como 'openai', "
+            "'google_genai', 'anthropic' ou 'groq'."
+        )
+        raise ValueError(msg)
+    if use_search:
+        msg = (
+            "adataframeit não suporta busca web (use_search=True): o agente de busca e as "
+            "ferramentas do Tavily e do Exa chamam a rede de forma síncrona. Use dataframeit()."
+        )
+        raise ValueError(msg)
+
+
+@dataclass(frozen=True)
+class _AsyncBackend:
+    """Nome e corrotina de chamada do backend de adataframeit, vinculados à execução."""
+
+    label: str
+    ainvoke: Callable[[str], Awaitable[dict[str, Any]]]
+
+
+def _async_backend(
+    config: LLMConfig, pydantic_model: type[BaseModel], user_prompt: str
+) -> _AsyncBackend:
+    """O backend do LangChain sem busca, o único de adataframeit, que chama `ainvoke`.
+
+    O modelo estruturado é um só para a execução, construído na primeira linha,
+    como no backend síncrono de _provider_backend.
+    """
+    structured_llm = _BuildOnce(lambda: build_structured_llm(pydantic_model, config))
+    return _AsyncBackend(
+        label="langchain",
+        ainvoke=lambda text: acall_langchain(
+            text, pydantic_model, user_prompt, config, structured_llm=structured_llm
+        ),
+    )
+
+
+class _NoMonitorTqdm(tqdm):
+    """Barra de progresso sem a thread de monitoramento do tqdm.
+
+    O tqdm abre uma thread (TMonitor) na primeira barra do processo. Sem
+    threads, como no Pyodide, a abertura falha, e o tqdm avisa e desliga o
+    monitor de todas as barras do processo. O laço assíncrono atualiza a barra
+    a cada linha e não precisa dele.
+    """
+
+    monitor_interval = 0
+
+
+async def _anotify_row_done(
+    on_row_done: Callable[[RowResult], object] | None, result: RowResult
+) -> None:
+    """Entrega a linha ao callback e espera o que ele devolver, se for awaitable.
+
+    Como em _notify_row_done, a falha do callback vira aviso, e a execução segue.
+    """
+    if on_row_done is None:
+        return
+    try:
+        returned = on_row_done(result)
+        if inspect.isawaitable(returned):
+            await returned
+    except Exception as e:  # noqa: BLE001 (o callback é do usuário; a falha dele não para a execução)
+        _warn_row_done_failed(result, e)
+
+
+async def _aprocess_rows(  # noqa: C901, PLR0913, PLR0915 (estado da execução repassado por adataframeit, e um ramo por desfecho da linha)
+    df: pd.DataFrame,
+    *,
+    text_column: str,
+    status_col: str,
+    expected_columns: list[str],
+    nan_columns: Collection[str] = (),
+    value_columns: Collection[str] = (),
+    config: LLMConfig,
+    backend: _AsyncBackend,
+    to_process: list[bool],
+    processed_count: int,
+    conversion_info: ConversionInfo,
+    track_tokens: bool,
+    reprocess_columns: Sequence[str] | None = None,
+    parallel_requests: int = 1,
+    trace_mode: str | None = None,
+    checkpoint: _Checkpoint | None = None,
+    on_row_done: Callable[[RowResult], object] | None = None,
+) -> TokenStats:
+    """Processa as linhas no event loop, com até `parallel_requests` em voo, sem threads.
+
+    É o laço de adataframeit. `parallel_requests` corrotinas (workers) tiram a
+    próxima linha de uma fila única, na ordem do DataFrame, e a linha em voo
+    espera o provider com `await`, o que deixa as outras correrem na mesma
+    thread. Gravar a linha no DataFrame, contá-la e gravar o checkpoint não tem
+    `await` no meio: o event loop não alterna de linha durante isso, e nada
+    precisa de trava.
+
+    O desfecho de cada linha (sucesso, erro, texto ausente, interrupção por
+    ProviderAbortError), o callback, o checkpoint, as pausas e a redução de
+    workers por rate limit seguem os laços de dataframeit. `position` é a ordem
+    da linha na fila, como no modo paralelo. Com um worker, o rótulo da barra e
+    o resumo são os do modo sequencial; com mais, os do paralelo.
+
+    O cancelamento da tarefa (`asyncio.CancelledError`) e o Ctrl-C contam como
+    interrupção: a linha em voo não é registrada, as linhas não registradas são
+    marcadas como no abort, o checkpoint é gravado com elas, e a exceção segue.
+    """
+    started_at = time.time()
+    loop = asyncio.get_running_loop()
+    parallel = parallel_requests > 1
+    if parallel:
+        desc = _progress_description(
+            config, backend, conversion_info, f" [{parallel_requests} workers]"
+        )
+    else:
+        desc = _sequential_description(config, backend, conversion_info)
+    desc += _progress_suffix(df, reprocess_columns, processed_count)
+
+    token_stats = _empty_token_stats()
+    requests_completed = 0
+    current_workers = parallel_requests
+    # Até quando, no relógio do loop, a linha que começa pausa depois de um rate limit.
+    paused_until = -math.inf
+    ledger = _RowLedger(
+        df,
+        checkpoint,
+        partial(
+            _mark_unreached,
+            df,
+            to_process=to_process,
+            status_col=status_col,
+            reprocess_columns=reprocess_columns,
+            value_columns=value_columns,
+            nan_columns=nan_columns,
+        ),
+    )
+    # (posição na fila, (índice, linha)) de cada linha a processar.
+    pending_rows = enumerate(itertools.compress(df.iterrows(), to_process))
+
+    async def attempt(idx: Hashable, row: pd.Series) -> tuple[bool, dict[str, Any]] | None:
+        """Grava o desfecho da linha e devolve se deu certo e os campos gravados; None no abort."""
+        nonlocal requests_completed, current_workers, paused_until
+        row_already_processed = _row_already_processed(row, status_col)
+        if _is_missing_text(row[text_column]):
+            _record_missing_text(
+                df,
+                idx,
+                status_col=status_col,
+                row_already_processed=row_already_processed,
+                reprocess_columns=reprocess_columns,
+            )
+            return False, {}
+        if loop.time() < paused_until:
+            await asyncio.sleep(_RATE_LIMIT_PAUSE_SECONDS)
+            # A linha que não foi ao provider antes da interrupção fica para as marcas.
+            if "abort" in token_stats:
+                return None
+        try:
+            result = await backend.ainvoke(str(row[text_column]))
+            values = _record_success(
+                df,
+                idx,
+                result,
+                status_col=status_col,
+                expected_columns=expected_columns,
+                config=config,
+                track_tokens=track_tokens,
+                row_already_processed=row_already_processed,
+                reprocess_columns=reprocess_columns,
+                trace_mode=trace_mode,
+                token_stats=token_stats,
+            )
+        except ProviderAbortError as e:
+            token_stats.setdefault("abort", _abort_reason(e))
+            _add_failed_usage(token_stats, e)
+            return None
+        except Exception as e:  # noqa: BLE001 (qualquer falha da linha vira status 'error')
+            if current_workers > 1 and _is_rate_limit_safely(e):
+                current_workers = _halved_workers(current_workers)
+                paused_until = loop.time() + _RATE_LIMIT_WINDOW_SECONDS
+            _record_error_safely(
+                df,
+                idx,
+                e,
+                status_col=status_col,
+                config=config,
+                row_already_processed=row_already_processed,
+                reprocess_columns=reprocess_columns,
+                token_stats=token_stats,
+            )
+            return False, {}
+        requests_completed += 1
+        return True, values
+
+    async def run_row(position: int, idx: Hashable, row: pd.Series) -> None:
+        """Processa a linha, a registra, a entrega ao callback e grava o lote do checkpoint."""
+        started = time.monotonic()
+        try:
+            outcome = await attempt(idx, row)
+        except Exception as e:  # noqa: BLE001 (falha fora do tratamento da linha não para a execução)
+            # Escapou do tratamento da própria linha; sem isto ela ficaria sem
+            # status e sumiria da saída.
+            _record_unrecorded_error(df, idx, e, status_col=status_col)
+            outcome = (False, {})
+        if outcome is None:
+            return
+        success, values = outcome
+        save_due = ledger.register(idx)
+        await _anotify_row_done(
+            on_row_done,
+            RowResult(
+                index=idx,
+                position=position,
+                success=success,
+                error=_recorded_error(df, idx),
+                values=values,
+                elapsed_seconds=time.monotonic() - started,
+            ),
+        )
+        if save_due:
+            ledger.save()
+        if success and config.rate_limit_delay > 0:
+            await asyncio.sleep(config.rate_limit_delay)
+
+    def stopped(slot: int) -> bool:
+        """Se o worker para de tirar linhas: interrupção ou teto reduzido abaixo dele."""
+        return "abort" in token_stats or slot >= current_workers
+
+    async def worker(slot: int, pbar: tqdm) -> None:
+        """Tira linhas da fila até ela acabar ou o worker parar.
+
+        A redução por rate limit não corta a linha em voo: o worker acima do
+        novo teto termina a dele e sai. A linha que começa na janela do rate
+        limit pausa antes de ir ao provider, como no modo paralelo.
+        """
+        while not stopped(slot):
+            item = next(pending_rows, None)
+            if item is None:
+                return
+            position, (idx, row) = item
+            await run_row(position, idx, row)
+            pbar.update(1)
+
+    def save_on_interrupt() -> None:
+        """Grava as linhas registradas e as marcas que a última gravação não levou."""
+        ledger.save(also=bool(token_stats.get("abort")) or ledger.marked)
+
+    with _on_ctrl_c(
+        ledger.mark_on_interrupt,
+        save_on_interrupt,
+        (KeyboardInterrupt, asyncio.CancelledError),
+    ):
+        with _NoMonitorTqdm(total=sum(to_process), desc=desc) as pbar:
+            if parallel:
+                await asyncio.gather(*(worker(slot, pbar) for slot in range(parallel_requests)))
+            else:
+                # Na própria tarefa de adataframeit: os avisos da linha apontam a
+                # chamada do usuário, como no modo sequencial de dataframeit.
+                await worker(0, pbar)
+        aborted = "abort" in token_stats
+        if aborted:
+            ledger.mark()
+        # Save final: a cauda (< batch_size), o que uma gravação que falhou deixou de
+        # fora e as marcas de uma interrupção, que não contam como linha processada.
+        ledger.save(also=aborted)
+
+    if parallel:
+        token_stats["requests_completed"] = requests_completed
+        token_stats["elapsed_seconds"] = time.time() - started_at
+        token_stats["initial_workers"] = parallel_requests
+        token_stats["final_workers"] = current_workers
+        token_stats["workers_reduced"] = current_workers < parallel_requests
     return token_stats

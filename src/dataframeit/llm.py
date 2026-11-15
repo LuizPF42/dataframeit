@@ -13,6 +13,7 @@ from pydantic import BaseModel, ValidationError
 from .errors import (
     MAX_REJECTED_RULES,
     ProviderRejectedOutputError,
+    aretry_with_backoff,
     retry_with_backoff,
     validation_error_summary,
 )
@@ -32,7 +33,9 @@ class _BuildOnce(Generic[T]):
     A construção acontece na primeira linha processada, e não na entrada do
     backend: um erro de construção, como chave de API ausente, continua sendo
     erro da linha. Falha não fica em cache, então a linha seguinte tenta de
-    novo. O lock impede que threads do modo paralelo construam duas vezes.
+    novo. O lock impede que threads do modo paralelo construam duas vezes; no
+    modo assíncrono, a construção não tem `await` no meio, o event loop não
+    alterna de linha durante ela, e o lock nunca fica disputado.
     """
 
     def __init__(self, build: Callable[[], T]) -> None:
@@ -231,6 +234,81 @@ def build_structured_llm(pydantic_model: type[BaseModel], config: LLMConfig) -> 
     return chat_model(config).with_structured_output(pydantic_model, include_raw=True)
 
 
+class _Attempts:
+    """Estado e regras das tentativas de uma linha, comuns a call_langchain e acall_langchain.
+
+    Depois de uma resposta recusada, a tentativa seguinte leva ao modelo a
+    resposta e o erro, porque repetir o mesmo prompt tende a repetir o mesmo
+    erro. O uso soma as tentativas cuja resposta chegou, recusadas ou não,
+    porque todas são cobradas. Os dois caminhos só diferem em como chamam o
+    modelo (`invoke` ou `ainvoke`) e como esperam entre tentativas.
+    """
+
+    def __init__(self, text: str, pydantic_model: type[BaseModel], user_prompt: str) -> None:
+        self.pydantic_model = pydantic_model
+        self.prompt = build_prompt(user_prompt, text)
+        self.correction: dict[str, str | None] = {"ai": None, "human": None}
+        self.usage_total: Usage = {}
+
+    def messages(self) -> str | list[tuple[str, str]]:
+        """O que a próxima tentativa manda ao modelo."""
+        return _messages(self.prompt, self.correction)
+
+    def reject(self, error: ValidationError | OutputParserException) -> NoReturn:
+        """Trata a resposta que a chamada ao modelo recusou antes de devolvê-la."""
+        if isinstance(error, ValidationError):
+            # O SDK da OpenAI valida a resposta dentro da chamada (json_schema e
+            # Responses API) e levanta antes de devolver a mensagem. Só a validação
+            # do próprio modelo é resposta recusada: um ValidationError de outro
+            # modelo, como a configuração do provider, segue como erro comum.
+            if error.title != _model_title(self.pydantic_model):
+                raise error
+            raw_text, usage = _sdk_rejected_response(error)
+            _add_usage(self.usage_total, usage)
+            _request_correction(
+                self.pydantic_model, None, error, self.correction, raw_text=raw_text
+            )
+        # Resposta sem tool call quando o modelo não aceita tool_choice forçado,
+        # ou com thinking na Anthropic: o parser levanta dentro da chamada.
+        # Sem llm_output, o texto do erro é aviso interno do LangChain, que não
+        # ajuda o modelo; o pedido fica o genérico de formato. O uso dessa
+        # tentativa não chega até aqui.
+        _request_correction(
+            self.pydantic_model,
+            None,
+            error if error.llm_output else None,
+            self.correction,
+            raw_text=str(error.llm_output or ""),
+        )
+
+    def parse(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Soma o uso da resposta e devolve os dados, ou pede correção se ela não valida."""
+        raw_message = result.get("raw")
+        if raw_message is not None and getattr(raw_message, "usage_metadata", None):
+            _add_usage(self.usage_total, _parse_usage_metadata(raw_message.usage_metadata))
+
+        if result.get("parsing_error"):
+            _request_correction(
+                self.pydantic_model, raw_message, result["parsing_error"], self.correction
+            )
+        parsed = result.get("parsed")
+        if parsed is None:
+            _request_correction(self.pydantic_model, raw_message, None, self.correction)
+
+        return {"data": parsed.model_dump(by_alias=False), "usage": dict(self.usage_total) or None}
+
+
+def _structured_model(
+    pydantic_model: type[BaseModel],
+    config: LLMConfig,
+    structured_llm: _BuildOnce[Runnable[Any, Any]] | None,
+) -> Runnable[Any, Any]:
+    """O modelo estruturado compartilhado pela execução, ou um construído agora."""
+    if structured_llm is not None:
+        return structured_llm()
+    return build_structured_llm(pydantic_model, config)
+
+
 def call_langchain(
     text: str,
     pydantic_model: type[BaseModel],
@@ -251,64 +329,55 @@ def call_langchain(
     Returns:
         Dicionário com 'data' (dados extraídos) e 'usage' (metadata de uso de tokens).
     """
-    if structured_llm is not None:
-        model = structured_llm()
-    else:
-        model = build_structured_llm(pydantic_model, config)
-
-    prompt = build_prompt(user_prompt, text)
-    # Estado entre tentativas: depois de uma resposta recusada, a tentativa
-    # seguinte leva ao modelo a resposta e o erro, porque repetir o mesmo prompt
-    # tende a repetir o mesmo erro. O uso soma as tentativas cuja resposta chegou,
-    # recusadas ou não, porque todas são cobradas.
-    correction: dict[str, str | None] = {"ai": None, "human": None}
-    usage_total: Usage = {}
+    model = _structured_model(pydantic_model, config, structured_llm)
+    attempts = _Attempts(text, pydantic_model, user_prompt)
 
     def _call() -> dict[str, Any]:
         try:
-            result = model.invoke(_messages(prompt, correction))
-        except ValidationError as error:
-            # O SDK da OpenAI valida a resposta dentro da chamada (json_schema e
-            # Responses API) e levanta antes de devolver a mensagem. Só a validação
-            # do próprio modelo é resposta recusada: um ValidationError de outro
-            # modelo, como a configuração do provider, segue como erro comum.
-            if error.title != _model_title(pydantic_model):
-                raise
-            raw_text, usage = _sdk_rejected_response(error)
-            _add_usage(usage_total, usage)
-            _request_correction(pydantic_model, None, error, correction, raw_text=raw_text)
-        except OutputParserException as error:
-            # Resposta sem tool call quando o modelo não aceita tool_choice forçado,
-            # ou com thinking na Anthropic: o parser levanta dentro da chamada.
-            # Sem llm_output, o texto do erro é aviso interno do LangChain, que não
-            # ajuda o modelo; o pedido fica o genérico de formato. O uso dessa
-            # tentativa não chega até aqui.
-            _request_correction(
-                pydantic_model,
-                None,
-                error if error.llm_output else None,
-                correction,
-                raw_text=str(error.llm_output or ""),
-            )
-
-        raw_message = result.get("raw")
-        if raw_message is not None and getattr(raw_message, "usage_metadata", None):
-            _add_usage(usage_total, _parse_usage_metadata(raw_message.usage_metadata))
-
-        if result.get("parsing_error"):
-            _request_correction(pydantic_model, raw_message, result["parsing_error"], correction)
-        parsed = result.get("parsed")
-        if parsed is None:
-            _request_correction(pydantic_model, raw_message, None, correction)
-
-        return {"data": parsed.model_dump(by_alias=False), "usage": dict(usage_total) or None}
+            result = model.invoke(attempts.messages())
+        except (ValidationError, OutputParserException) as error:
+            attempts.reject(error)
+        return attempts.parse(result)
 
     try:
         return retry_with_backoff(_call, config.max_retries, config.base_delay, config.max_delay)
     except Exception as error:
         # A linha falhou, mas as tentativas cuja resposta chegou foram cobradas;
         # o core soma esse uso ao resumo. Atributo dinâmico, lido com getattr.
-        error.row_usage = usage_total  # ty: ignore[unresolved-attribute]
+        error.row_usage = attempts.usage_total  # ty: ignore[unresolved-attribute]
+        raise
+
+
+async def acall_langchain(
+    text: str,
+    pydantic_model: type[BaseModel],
+    user_prompt: str,
+    config: LLMConfig,
+    structured_llm: _BuildOnce[Runnable[Any, Any]] | None = None,
+) -> dict[str, Any]:
+    """Versão assíncrona de call_langchain, que chama o modelo com `ainvoke`.
+
+    O `invoke` do structured output abre uma thread no `RunnableParallel` do
+    LangChain, e o `ainvoke` não; é o que permite rodar sem threads, como no
+    Pyodide. Correção, uso e tentativas seguem as regras de call_langchain.
+    """
+    model = _structured_model(pydantic_model, config, structured_llm)
+    attempts = _Attempts(text, pydantic_model, user_prompt)
+
+    async def _call() -> dict[str, Any]:
+        try:
+            result = await model.ainvoke(attempts.messages())
+        except (ValidationError, OutputParserException) as error:
+            attempts.reject(error)
+        return attempts.parse(result)
+
+    try:
+        return await aretry_with_backoff(
+            _call, config.max_retries, config.base_delay, config.max_delay
+        )
+    except Exception as error:
+        # Ver call_langchain.
+        error.row_usage = attempts.usage_total  # ty: ignore[unresolved-attribute]
         raise
 
 

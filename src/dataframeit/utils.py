@@ -1600,17 +1600,23 @@ def get_nested_pydantic_models(field_type: object) -> list[type[BaseModel]]:
     return list(dict.fromkeys(models))
 
 
+# As funções públicas de core.py, cuja chamada os avisos apontam.
+_ENTRY_POINTS = frozenset({"dataframeit", "adataframeit"})
+
+
 def _user_stacklevel() -> int:  # pragma: no mutate block
     """Devolve o stacklevel que leva o aviso à linha que chamou `dataframeit`.
 
     Vale para o `warnings.warn` da função que chama esta, qualquer que seja o
-    caminho até ela, inclusive por um `contextlib`. Na thread do executor não há
-    essa chamada na pilha, e o aviso aponta a própria função.
+    caminho até ela, inclusive por um `contextlib`, e para `adataframeit`, cuja
+    corrotina fica na pilha enquanto ela espera outra. Na thread do executor e
+    nos workers do modo assíncrono com mais de uma linha em voo, que são outras
+    tarefas, não há essa chamada na pilha, e o aviso aponta a própria função.
     """
     frame, level = inspect.currentframe(), 0
     while frame is not None:
         if (
-            frame.f_code.co_name == "dataframeit"
+            frame.f_code.co_name in _ENTRY_POINTS
             and frame.f_globals.get("__name__") == f"{__package__}.core"
         ):
             return level + 1

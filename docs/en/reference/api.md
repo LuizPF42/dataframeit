@@ -198,6 +198,28 @@ result = dataframeit(
 
 ---
 
+## adataframeit()
+
+Async version of `dataframeit()`, to run without threads, as in Pyodide. It takes the same parameters, in the same order and with the same defaults, and returns the same result:
+
+```python
+result = await adataframeit(df, Model, PROMPT, parallel_requests=5)
+```
+
+Differences from `dataframeit()`:
+
+| Parameter | In `adataframeit()` |
+|-----------|---------------------|
+| `parallel_requests` | Rows in flight as coroutines in the event loop, not threads |
+| `max_retries`, `base_delay`, `max_delay`, `rate_limit_delay` | Waits with `asyncio.sleep`, which does not block the event loop |
+| `on_row_done` | Called in the event loop; if it returns an awaitable (an `async def` function), it is awaited |
+| `provider` | `'codex'` and `'claude_code'` raise `ValueError` |
+| `use_search` | `True` raises `ValueError` |
+
+Cancelling the task saves the checkpoint and leaves the row in flight without status, like Ctrl-C in `dataframeit()`. More in [Async Mode and Browser](../guides/performance.md#async-mode-and-browser-pyodide).
+
+---
+
 ## read_df()
 
 Reads files in various formats to a DataFrame and turns lists, dicts and nested models saved as JSON (or as Python repr) back into their original structures. Use it to reload a checkpoint or a saved result before resuming with `resume=True`.
