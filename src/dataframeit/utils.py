@@ -25,21 +25,30 @@ import typing
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, get_args, get_origin
+from typing import TYPE_CHECKING, Any, Literal, get_args, get_origin, overload
 
 import pandas as pd
-from pandas.api.types import is_integer_dtype, is_string_dtype
+from pandas.api.types import is_float_dtype, is_integer_dtype, is_string_dtype
 from pydantic import BaseModel, Field, create_model
 
 if TYPE_CHECKING:
     import os
     from collections.abc import Callable, Collection, Generator, Hashable, Mapping
 
+    from pandas.api.typing import JsonReader
+    from pandas.io.parsers import TextFileReader
     from polars import DataFrame as PolarsDataFrame
     from polars import Series as PolarsSeries
+
+    # Tudo o que `read_df` pode devolver: o DataFrame e o que o leitor do pandas
+    # devolve no lugar dele. O parâmetro do JsonReader fica Any, porque é um no
+    # pandas e outro no pandas-stubs.
+    _ReadResult = (
+        pd.DataFrame | pd.Series | dict[int | str, pd.DataFrame] | TextFileReader | JsonReader[Any]
+    )
 
 # Import opcional de Polars
 try:
@@ -95,7 +104,7 @@ class ConversionInfo:
     """Informações sobre a conversão de dados para pandas DataFrame."""
 
     original_type: str
-    original_index: pd.Index | list[Any] | None = None  # Índice/chaves originais para reconversão
+    original_index: pd.Index | list[Any] | None = None  # Índice da pandas.Series de entrada
     series_name: Hashable | None = None  # Nome original da Series (se aplicável)
     # DataFrame polars de entrada, de onde a saída tira as colunas que a execução não escreve
     polars_frame: PolarsDataFrame | None = None
@@ -204,12 +213,14 @@ def to_pandas(
         keys = list(data.keys())
         values = list(data.values())
         # tupleize_cols=False: com chaves-tupla, o pd.Index padrão criaria um
-        # MultiIndex, e a saída mudaria de forma para o usuário.
-        df = pd.DataFrame({DEFAULT_TEXT_COLUMN: values}, index=pd.Index(keys, tupleize_cols=False))
-        return df, ConversionInfo(
-            original_type=ORIGINAL_TYPE_DICT,
-            original_index=keys,
+        # MultiIndex, e a saída mudaria de forma para o usuário. O None, que o
+        # teste de mutação põe no lugar do False, também é falso.
+        index = pd.Index(
+            keys,
+            tupleize_cols=False,  # pragma: no mutate
         )
+        df = pd.DataFrame({DEFAULT_TEXT_COLUMN: values}, index=index)
+        return df, ConversionInfo(original_type=ORIGINAL_TYPE_DICT)
 
     msg = (
         f"Tipo não suportado: {type(data).__name__}. "
@@ -248,6 +259,10 @@ def _python_values(data: PolarsDataFrame, model_columns: Mapping[str, object]) -
     return df
 
 
+# Os tipos cujo valor o CSV devolve em texto ao lado de um texto na mesma coluna.
+_NUMBER_CLASSES = (int, float, bool)
+
+
 def _members(annotation: object) -> list[object]:
     """Os membros da união, ou a própria anotação, cada um por `_without_optional`."""
     annotation = _without_optional(annotation)
@@ -271,10 +286,44 @@ def _admits_int(annotation: object) -> bool:
     )
 
 
+def _admits_any(annotation: object) -> bool:
+    """Se a anotação é `Any` ou `object`, ou a união com um deles entre os membros.
+
+    O campo aceita qualquer valor, e a validação não diz em que forma a célula
+    relida de um arquivo deveria estar.
+    """
+    return any(member is typing.Any or member is object for member in _members(annotation))
+
+
+def _mixes_text_and_number(annotation: object) -> bool:
+    """Se a anotação é a união de `str` com `int`, `float` ou `bool`, sem outro tipo além de None.
+
+    O CSV e o XLSX não dizem se a célula `123` guarda o número ou o texto, e o
+    leitor devolve ausente o texto "N/A": o checkpoint grava entre aspas o
+    texto que o leitor trocaria (`_quoted_scalar_text`).
+    """
+    members = set(_members(annotation))
+    return (
+        str in members
+        and not members.isdisjoint(_NUMBER_CLASSES)
+        and members <= {str, type(None), *_NUMBER_CLASSES}
+    )
+
+
+def _admits_decimal(annotation: object) -> bool:
+    """Se a anotação é `Decimal`, ou a união com ele entre os membros."""
+    return any(member is Decimal for member in _members(annotation))
+
+
+def _accepts_only_decimal(annotation: object) -> bool:
+    """Se a anotação é `Decimal`, sozinho ou com None."""
+    return _members(annotation) == [Decimal]
+
+
 def _excluded_fields(model: type[BaseModel]) -> frozenset[str]:
     """Os campos com exclude=True, que não saem no model_dump e que a execução não grava."""
     return frozenset(
-        field_name for field_name, field in model.model_fields.items() if field.exclude
+        field_name for field_name, field in model.model_fields.items() if field.exclude is True
     )
 
 
@@ -296,7 +345,7 @@ def _dropped_by_model_serializer(
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            probe = model.model_construct(**dict.fromkeys(model.model_fields, None))
+            probe = model.model_construct(**dict.fromkeys(model.model_fields))
             dumped = probe.model_dump(by_alias=False).keys()
     except Exception:  # noqa: BLE001 (o serializador e o model_post_init são do usuário e podem cair com o None)
         return frozenset()
@@ -418,7 +467,7 @@ def from_pandas(
                 # que não o tem, como o None. O map_elements guarda o que a função
                 # devolve, sem inspecionar.
                 items = values.tolist()
-                positions = pl.Series(col, range(len(items)), dtype=pl.Int64)
+                positions = pl.Series(col, range(len(items)))
                 columns.append(positions.map_elements(items.__getitem__, return_dtype=pl.Object))
                 as_object.append(col)
         if as_object:
@@ -427,7 +476,6 @@ def from_pandas(
                 "coluna tipada e saem com o tipo Object, com os objetos Python que o modelo "
                 "devolveu, exceto o Enum fora de lista ou dict, que sai pelo valor. Converta-as "
                 "antes de gravar em arquivo.",
-                UserWarning,
                 stacklevel=_user_stacklevel(),
             )
         return pl.DataFrame(columns)
@@ -501,7 +549,7 @@ def _json_default(value: object) -> object:
     return str(value)
 
 
-def _resolved(annotation: object) -> object:
+def _resolved(annotation: object, localns: Mapping[str, object] | None = None) -> object:
     """A anotação sem NewType, apelido `type` e TypeVar, pelo tipo a que eles se referem.
 
     É o ponto único em que os helpers deste módulo que inspecionam anotação
@@ -516,19 +564,176 @@ def _resolved(annotation: object) -> object:
     `type Opcional[T] = T | None`, tem o apelido como origem, e o `__value__`
     dele traz os parâmetros por substituir (ver `_alias_applied`). O TypeVar
     que fica sem argumento, como o do modelo genérico sem parâmetro, vale o
-    tipo com que o pydantic o valida (`_typevar_validated_as`).
+    tipo com que o pydantic o valida (`_typevar_validated_as`). A referência
+    em texto no tipo de qualquer dos três, como o `bound="Item"` do TypeVar,
+    é trocada pelo tipo, procurado em `localns` e no módulo em que o tipo
+    nomeado foi declarado (`_evaluated`).
     """
     while True:
         if isinstance(annotation, typing.TypeVar):
-            annotation = _typevar_validated_as(annotation)
+            annotation = _named_type(_typevar_validated_as(annotation), annotation, localns)
         elif isinstance(annotation, typing.NewType):
-            annotation = annotation.__supertype__
+            annotation = _named_type(annotation.__supertype__, annotation, localns)
         elif type(annotation).__name__ == "TypeAliasType":
-            annotation = annotation.__value__  # ty: ignore[unresolved-attribute]
+            annotation = _alias_value(annotation, localns)
         elif type(get_origin(annotation)).__name__ == "TypeAliasType":
-            annotation = _alias_applied(get_origin(annotation), get_args(annotation))
+            annotation = _alias_applied(get_origin(annotation), get_args(annotation), localns)
         else:
             return annotation
+
+
+def _alias_value(alias: object, localns: Mapping[str, object] | None = None) -> Any:  # noqa: ANN401 (anotação de tipo arbitrária)
+    """O `__value__` do apelido `type` com as referências em texto trocadas pelos tipos.
+
+    O valor guarda como texto a referência adiantada, como o `"Item"` de
+    `TypeAliasType("Itens", list["Item"])`, e o valor inteiro escrito entre
+    aspas. O nome é procurado no módulo em que o apelido foi declarado, entre
+    os parâmetros dele e no próprio nome dele, o do apelido recursivo; com
+    `localns`, antes do módulo, também nesses nomes. O apelido não guarda o
+    escopo da função em que foi declarado, e o nome que só existe ali não é
+    achado: o erro diz qual é, porque o submodelo atrás dele ficaria fora da
+    configuração por campo sem aviso.
+    """
+    own = {param.__name__: param for param in alias.__type_params__}  # ty: ignore[unresolved-attribute]
+    name = alias.__name__  # ty: ignore[unresolved-attribute]
+    try:
+        return _evaluated(
+            alias.__value__,  # ty: ignore[unresolved-attribute]
+            alias,
+            {**(localns or {}), **own, name: alias},
+        )
+    except NameError as error:
+        msg = (
+            f"O apelido de tipo '{name}' se refere a um nome por texto que não foi "
+            f"encontrado no módulo '{alias.__module__}': {error}. Declare o apelido "
+            "depois da classe e sem aspas, ou declare os dois no nível do módulo."
+        )
+        raise TypeError(msg) from error
+
+
+def _named_type(value: object, named: object, localns: Mapping[str, object] | None) -> object:
+    """O tipo `value` do NewType ou do TypeVar `named`, com a referência em texto trocada.
+
+    O nome é procurado como o do apelido (`_evaluated`). A referência que não
+    se resolve fica como está, e o tipo atrás dela não é visto: o pydantic a
+    procura no escopo do modelo, que o NewType e o TypeVar declarados em outro
+    módulo não conhecem, e o parâmetro de `class Caixa[T: "Item"]` nem diz em
+    que módulo foi declarado. A que volta ao próprio `named` também fica.
+    """
+    try:
+        evaluated = _evaluated(value, named, localns)
+    except Exception:  # noqa: BLE001 (o texto é do usuário: nome que falta, atributo, sintaxe)
+        return value
+    return value if evaluated is named else evaluated
+
+
+def _evaluated(value: object, named: object, localns: Mapping[str, object] | None = None) -> Any:  # noqa: ANN401 (anotação de tipo arbitrária)
+    """O tipo `value`, de `named`, com as referências em texto trocadas pelos tipos.
+
+    `named` é o apelido `type`, o NewType ou o TypeVar que guarda `value`, e o
+    nome em texto é procurado em `localns` e no módulo em que `named` foi
+    declarado. Levanta o NameError do nome que não é achado.
+    """
+    name = named.__name__  # ty: ignore[unresolved-attribute]
+    # O TypeVar criado fora de um módulo, como no `exec`, tem None no lugar do nome.
+    module = sys.modules.get(named.__module__)
+    return typing.get_type_hints(
+        types.SimpleNamespace(__annotations__={name: value}),
+        globalns=vars(module) if module is not None else {},
+        localns=dict(localns or {}),
+        include_extras=True,
+    )[name]
+
+
+def _refuse_shadowed_name(annotation: object, owner: type[BaseModel]) -> None:
+    """Recusa a referência em texto que o modelo dono resolve para outra classe.
+
+    Vale para o texto dentro de um apelido `type`, de um NewType ou de um
+    TypeVar, em qualquer nível da anotação. O pydantic procura o nome primeiro
+    no próprio modelo e no escopo em que ele foi declarado, e `_resolved`, que
+    não recebe o modelo, só no módulo do tipo nomeado. Com uma classe de mesmo
+    nome dentro da função e outra no módulo, o modelo valida com a de dentro, e
+    a configuração por campo leria a do módulo, sem aviso.
+
+    O modelo declarado no nível do módulo não tem esse escopo e passa direto. A
+    referência que o módulo não resolve fica de fora (`_shadowed`): a do
+    apelido já é recusada onde ele é lido (`_alias_value`), e a do NewType e do
+    TypeVar fica como está (`_named_type`).
+    """
+    parent = owner.__pydantic_parent_namespace__
+    if parent is None:
+        return
+    local = {
+        name: value() if type(value).__name__.endswith("WeakRef") else value
+        for name, value in parent.items()
+    }
+    # O teste de mutação troca o modelo por None, que o texto também resolve
+    # para outra coisa que a classe do módulo, e a recusa sai igual.
+    local[owner.__name__] = owner  # pragma: no mutate
+    try:
+        by_module = _expanded(annotation, None)
+        by_owner = _expanded(annotation, local)
+    except TypeError:
+        return
+    if _shadowed(by_owner, by_module):
+        msg = (
+            f"A anotação {annotation!r} do modelo '{owner.__name__}' usa um apelido de tipo, "
+            "um NewType ou um TypeVar com referência em texto a um nome que é uma classe no "
+            "escopo em que o modelo foi declarado e outra no módulo do tipo nomeado: o "
+            "modelo valida com a primeira, e a configuração por campo leria a segunda. "
+            "Declare o tipo sem aspas, ou dê nomes diferentes às duas classes."
+        )
+        raise TypeError(msg)
+
+
+def _expanded(
+    annotation: object, localns: Mapping[str, object] | None, seen: tuple[object, ...] = ()
+) -> object:
+    """A anotação com os tipos nomeados resolvidos em todo nível, para comparar duas resoluções.
+
+    Cada nível com argumentos vira a tupla dos argumentos expandidos. Do
+    `Annotated` só entra o tipo: o metadado não é anotação, e o tipo nomeado
+    que estiver ali não é lido pelo pydantic nem pela configuração por campo.
+    O valor do `Literal` entra como está, igual nas duas resoluções. O apelido
+    recursivo, que volta a um nível já aberto, para ali.
+    """
+    resolved = _resolved(annotation, localns)
+    args = get_args(resolved)
+    if not args or resolved in seen:
+        return resolved
+    if get_origin(resolved) is typing.Annotated:
+        args = args[:1]
+    return tuple(_expanded(arg, localns, (*seen, resolved)) for arg in args)
+
+
+def _shadowed(by_owner: object, by_module: object) -> bool:
+    """Se as duas expansões (`_expanded`) dão classes diferentes em algum ramo.
+
+    O ramo que o módulo deixa em texto fica de fora: ali a configuração por
+    campo não lê classe nenhuma. Os demais se comparam um a um, e a referência
+    sem resolver num deles não esconde a classe trocada em outro. Quando as
+    duas expansões não têm a mesma forma, como a união que o escopo do modelo
+    reduz a um membro só, os ramos não se casam, e o texto em qualquer ponto do
+    lado do módulo deixa a anotação de fora.
+    """
+    if (
+        isinstance(by_owner, tuple)
+        and isinstance(by_module, tuple)
+        and len(by_owner) == len(by_module)
+    ):
+        # As duas tuplas têm o mesmo tamanho, e o strict do zip nunca levanta.
+        return any(
+            _shadowed(*pair)
+            for pair in zip(by_owner, by_module, strict=True)  # pragma: no mutate
+        )
+    return by_owner != by_module and not _holds_text(by_module)
+
+
+def _holds_text(expanded: object) -> bool:
+    """Se a anotação expandida (`_expanded`) ainda guarda uma referência em texto."""
+    if isinstance(expanded, tuple):
+        return any(_holds_text(part) for part in expanded)
+    return isinstance(expanded, (str, typing.ForwardRef))
 
 
 def _typevar_validated_as(typevar: typing.TypeVar) -> object:
@@ -548,7 +753,9 @@ def _typevar_validated_as(typevar: typing.TypeVar) -> object:
     return typing.Any
 
 
-def _alias_applied(alias: object, args: tuple[Any, ...]) -> object:
+def _alias_applied(
+    alias: object, args: tuple[Any, ...], localns: Mapping[str, object] | None = None
+) -> object:
     """O `__value__` do apelido genérico com cada parâmetro trocado pelo argumento.
 
     Cada parâmetro de `__type_params__` vale o argumento na mesma posição. A
@@ -558,7 +765,7 @@ def _alias_applied(alias: object, args: tuple[Any, ...]) -> object:
     que é o próprio parâmetro não tem `__parameters__` e é trocado direto; o
     que não usa parâmetro nenhum fica como está.
     """
-    value = alias.__value__  # ty: ignore[unresolved-attribute]
+    value = _alias_value(alias, localns)
     # O teste de mutação troca o strict=False por None ou pelo default, que também
     # são falsos, e o () do getattr por None, que o `not` trata igual.
     by_param = dict(zip(alias.__type_params__, args, strict=False))  # ty: ignore[unresolved-attribute]  # pragma: no mutate
@@ -595,7 +802,7 @@ _TEMPORAL = (dt.date, dt.datetime, dt.time, dt.timedelta)
 _CONVERTED_PAIRS = ((float, bool), (bytes, str))
 
 
-def _mixes_converted_types(annotation: object) -> bool:
+def _mixes_converted_types(annotation: object, seen: tuple[object, ...] = ()) -> bool:
     """Se a anotação junta, na união ou na tupla, tipos que o pyarrow converte uns nos outros.
 
     São os de `_TEMPORAL` com qualquer outro tipo e os pares de
@@ -604,10 +811,16 @@ def _mixes_converted_types(annotation: object) -> bool:
     `list[tuple[date, int]]` e para listas aninhadas. O Optional, o Annotated,
     o NewType e o apelido `type` são desembrulhados, na anotação e em cada
     membro. A busca é por identidade, porque o membro pode não ter hash.
+    `seen` são as anotações em que a descida já está: o apelido recursivo,
+    como `type Lista = tuple[int, Lista] | None`, chega de novo a uma delas,
+    que não é percorrida outra vez.
     """
+    if annotation in seen:
+        return False
+    seen = (*seen, annotation)
     annotation = _without_optional(annotation)
     origin, args = get_origin(annotation), get_args(annotation)
-    if origin in (list, tuple) and any(_mixes_converted_types(arg) for arg in args):
+    if origin in (list, tuple) and any(_mixes_converted_types(arg, seen) for arg in args):
         return True
     if origin not in (typing.Union, types.UnionType, tuple):
         return False
@@ -792,7 +1005,11 @@ def _to_polars(values: pd.Series, annotation: object) -> PolarsSeries:
     if (origin or annotation) is dict:
         values = pd.Series(
             [
-                json.dumps(value, ensure_ascii=False, default=_json_default)
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    default=_json_default,
+                )
                 if isinstance(value, dict)
                 else value
                 for value in values
@@ -1088,12 +1305,85 @@ def normalize_complex_columns(df: pd.DataFrame, complex_fields: set[str]) -> Non
                 df[col] = df[col].apply(normalize_value)
 
 
+# Os overloads ligam o argumento de leitura que muda o que o pandas devolve ao
+# tipo devolvido. O de `typ="series"` e o do DataFrame declaram os outros
+# argumentos só com os valores que mantêm esse tipo, para que o argumento de
+# tipo mais largo, como `chunksize: int | None`, não case com eles: esse cai no
+# último, que devolve a união de tudo.
+@overload
+def read_df(
+    path: str | os.PathLike[str],
+    model: type[BaseModel] | None = None,
+    normalize: bool = True,  # noqa: FBT001, FBT002 (posicional na API pública)
+    *,
+    chunksize: int,
+    **kwargs: Any,
+) -> TextFileReader | JsonReader[Any]: ...
+
+
+@overload
+def read_df(
+    path: str | os.PathLike[str],
+    model: type[BaseModel] | None = None,
+    normalize: bool = True,  # noqa: FBT001, FBT002 (posicional na API pública)
+    *,
+    iterator: Literal[True],
+    **kwargs: Any,
+) -> TextFileReader: ...
+
+
+@overload
+def read_df(
+    path: str | os.PathLike[str],
+    model: type[BaseModel] | None = None,
+    normalize: bool = True,  # noqa: FBT001, FBT002 (posicional na API pública)
+    *,
+    sheet_name: list[Any] | None,
+    **kwargs: Any,
+) -> dict[int | str, pd.DataFrame]: ...
+
+
+@overload
+def read_df(
+    path: str | os.PathLike[str],
+    model: type[BaseModel] | None = None,
+    normalize: bool = True,  # noqa: FBT001, FBT002 (posicional na API pública)
+    *,
+    typ: Literal["series"],
+    chunksize: None = None,
+    **kwargs: Any,
+) -> pd.Series: ...
+
+
+@overload
+def read_df(
+    path: str | os.PathLike[str],
+    model: type[BaseModel] | None = None,
+    normalize: bool = True,  # noqa: FBT001, FBT002 (posicional na API pública)
+    *,
+    chunksize: None = None,
+    iterator: Literal[False] = False,
+    sheet_name: int | str = 0,
+    typ: Literal["frame"] = "frame",
+    **kwargs: Any,
+) -> pd.DataFrame: ...
+
+
+@overload
 def read_df(
     path: str | os.PathLike[str],
     model: type[BaseModel] | None = None,
     normalize: bool = True,  # noqa: FBT001, FBT002 (posicional na API pública)
     **kwargs: Any,
-) -> pd.DataFrame:
+) -> _ReadResult: ...
+
+
+def read_df(
+    path: str | os.PathLike[str],
+    model: type[BaseModel] | None = None,
+    normalize: bool = True,  # noqa: FBT001, FBT002 (posicional na API pública)
+    **kwargs: Any,
+) -> _ReadResult:
     """Carrega um DataFrame de arquivo e normaliza estruturas Python automaticamente.
 
     Esta função é útil para carregar dados que foram previamente processados
@@ -1115,7 +1405,15 @@ def read_df(
                None na célula vazia. O NewType e o apelido `type` contam
                pelo tipo a que se referem. A coluna só com células vazias fica como lida: float
                no CSV e, na coluna nula que o checkpoint grava no parquet,
-               object com None.
+               object com None. Do .csv, do .xlsx e do .xls, a coluna do
+               campo só de Decimal vem com Decimal, com os dígitos do
+               arquivo, e a do campo que admite float, ou do campo Any, traz
+               o NaN que o checkpoint gravou como o texto "NaN", com None na
+               célula vazia; do .parquet, o NaN vem à parte do nulo. Do .csv,
+               o número e o bool de um campo Any, ou da união de str com int,
+               float ou bool, ao lado de um texto voltam número e bool, e,
+               nessa união, o texto que o checkpoint gravou entre aspas,
+               como "123" e "N/A", volta sem elas também do .xlsx.
         normalize: Se True (padrão), normaliza colunas que parecem conter JSON.
                    Se False, não faz nenhuma normalização.
         **kwargs: Argumentos adicionais passados para a função de leitura do pandas.
@@ -1126,7 +1424,10 @@ def read_df(
 
     Returns:
         DataFrame com estruturas Python normalizadas, ou o objeto do leitor do
-        pandas quando ele não devolve DataFrame (ver **kwargs).
+        pandas quando ele não devolve DataFrame (ver **kwargs). A anotação
+        acompanha o argumento: leitor de pedaços com chunksize ou
+        iterator=True, dict de abas com sheet_name=None ou lista, e Series
+        com typ="series".
 
     Raises:
         ValueError: Se o formato do arquivo não for suportado.
@@ -1162,9 +1463,7 @@ def read_df(
         # pandas o devolve.
         return df
 
-    if model is not None:
-        _reread_text_columns(df, file, ext, model, kwargs)
-        _reread_int_columns(df, file, ext, model, kwargs)
+    restored = _reread_as_written(df, file, ext, model, kwargs) if model is not None else set()
 
     # Normalizar colunas
     if not normalize:
@@ -1175,6 +1474,7 @@ def read_df(
         complex_fields = get_complex_fields(model)
         if complex_fields:
             normalize_complex_columns(df, complex_fields)
+        _normalize_any_columns(df, model, restored)
     else:
         # Normalizar todas as colunas que parecem ter JSON
         _normalize_all_json_columns(df)
@@ -1182,29 +1482,134 @@ def read_df(
     return df
 
 
-def _reread_text_columns(
+def _reread_as_written(
     df: pd.DataFrame, path: Path, ext: str, model: type[BaseModel], kwargs: dict[str, Any]
-) -> None:
-    """Relê como texto cru os campos de texto do modelo, in-place.
+) -> set[str]:
+    """Devolve às colunas dos campos do modelo o que o leitor do pandas trocou, in-place.
+
+    Devolve as colunas trocadas: nelas a célula ausente é None, e o NaN que
+    restar é valor (`_normalize_any_columns`).
+
+    O CSV e o XLSX são relidos uma vez só como texto cru, e cada coluna volta
+    conforme o campo (`_raw_restorer`); do parquet voltam o int exato e o NaN
+    à parte do nulo (`_reread_parquet`). Qualquer argumento de leitura desliga
+    a releitura, porque ele muda o que o leitor devolve, e a releitura sem ele
+    não casaria com o que foi lido: com on_bad_lines, a linha malformada deixa
+    de sê-lo quando só algumas colunas são lidas, volta na releitura e desloca
+    as seguintes; com index_col, parse_dates ou names, a releitura levanta;
+    dtype fixa tipos. A atribuição alinha pelo índice e não acusa a diferença
+    de tamanho. Mesmo sem argumento, o leitor do CSV dá à tabela um índice
+    próprio quando as linhas têm um campo a mais que o cabeçalho, e cada
+    coluna restaurada leva o índice da lida.
+    """
+    if kwargs:
+        return set()
+    if ext == ".parquet":
+        return _reread_parquet(df, path, model)
+    reader = _TEXT_READERS.get(ext)
+    if reader is None:
+        return set()
+    text_fields = get_text_fields(model)
+    restorers = {
+        name: restorer
+        for name, info in model.model_fields.items()
+        if name in df.columns
+        and (
+            restorer := _raw_restorer(
+                info.annotation, df[name], is_text=name in text_fields, is_csv=ext == ".csv"
+            )
+        )
+        is not None
+    }
+    if not restorers:
+        return set()
+    # O usecols só poupa a leitura das outras colunas, que a releitura não usa.
+    # Com todas as colunas nele, não poupa nada, e o leitor do CSV deixa de
+    # tirar o índice da primeira coluna do arquivo com um campo a mais por
+    # linha: as colunas voltariam deslocadas das lidas.
+    wanted = list(restorers) if len(restorers) < len(df.columns) else None
+    raw = reader(
+        path,
+        usecols=wanted,
+        dtype=str,
+        na_filter=False,
+    )
+    # As duas leituras são do mesmo arquivo, sem argumento que pule linhas, e
+    # têm o mesmo tamanho.
+    changed = set()
+    for col, restorer in restorers.items():
+        restored = restorer(raw[col], df[col])
+        if restored is not None:
+            df[col] = restored
+            changed.add(col)
+    return changed
+
+
+def _raw_restorer(  # noqa: PLR0911 (uma saída por tipo de campo)
+    annotation: object, read: pd.Series, *, is_text: bool, is_csv: bool
+) -> Callable[[pd.Series, pd.Series], pd.Series | None] | None:
+    """Como a coluna de um campo volta do texto cru do CSV ou do XLSX; None se fica como lida.
+
+    A função devolvida recebe a coluna em texto cru e a coluna lida, e devolve
+    a coluna restaurada, ou None quando o texto cru não muda nada nela.
+
+    O XLSX guarda número como double e fica fora da releitura do int, porque
+    o int que ele devolve já pode vir arredondado. Ele guarda o tipo de cada
+    célula, e dele o campo `Any` e a união de texto e número
+    (`_mixes_text_and_number`) só releem o NaN, a célula ausente e o texto
+    entre aspas; o número e o bool em texto são do CSV. O campo que admite
+    `float` vem antes do que admite `Decimal`: na união dos dois, o texto
+    "NaN" volta float NaN, que o campo aceita.
+    """
+    if is_text:
+        return _text_as_written
+    if is_csv and _accepts_only_int(annotation) and not is_integer_dtype(read):
+        return _int_as_written
+    is_any = _admits_any(annotation)
+    if is_any or _mixes_text_and_number(annotation):
+        texts = is_string_dtype(read.dtype)
+        # No `Any`, o texto entre aspas é JSON, que `_normalize_any_columns` lê.
+        unquote = not is_any
+        scalars = texts and is_csv
+        if not _holds_cell_to_restore(read, scalars=scalars, unquote=unquote):
+            return None
+        members = _members(annotation)
+        return functools.partial(
+            _scalars_as_written,
+            scalars=scalars,
+            nan=is_any or float in members,
+            # O int também é o número de um campo float: a validação o leva a float.
+            admitted=None
+            if is_any
+            else tuple(
+                cls
+                for cls in _NUMBER_CLASSES
+                if cls in members or (cls is int and float in members)
+            ),
+        )
+    # O leitor devolve ausente o texto do NaN, e a coluna sem célula ausente
+    # não o tem: só o campo só de Decimal é relido assim mesmo, pelos dígitos.
+    if _keeps_nan(annotation):
+        # O campo que também admite texto pode guardar só o texto "NaN" entre
+        # aspas (`_quoted_nan_text`), que o leitor não devolve ausente.
+        if not read.isna().any() and str not in _members(annotation):
+            return None
+        return _float_nan_as_written
+    if _admits_decimal(annotation):
+        every_cell = _accepts_only_decimal(annotation)
+        if not every_cell and not read.isna().any():
+            return None
+        return functools.partial(_decimal_as_written, every_cell=every_cell)
+    return None
+
+
+def _text_as_written(raw: pd.Series, _read: pd.Series) -> pd.Series:
+    """O texto cru do campo de texto: só a célula vazia vira ausência.
 
     Sem isso, "2023" volta como número e "N/A" ou "NA" viram ausência, e a
-    retomada acusa ou troca o valor. Só a célula vazia vira ausência.
-    Qualquer argumento de leitura desliga a releitura, porque, somado ao
-    usecols dela, ele pode mudar as linhas que o leitor devolve: com
-    on_bad_lines, a linha malformada deixa de sê-lo quando só as colunas de
-    texto são lidas, volta na releitura e desloca o texto das seguintes; com
-    index_col, parse_dates ou names, a releitura levanta. A atribuição alinha
-    pelo índice e não acusa a diferença de tamanho.
+    retomada acusa ou troca o valor.
     """
-    reader = _TEXT_READERS.get(ext)
-    if reader is None or kwargs:
-        return
-    text_columns = [f for f in get_text_fields(model) if f in df.columns]
-    if not text_columns:
-        return
-    raw = reader(path, usecols=text_columns, dtype=str, na_filter=False)
-    for col in text_columns:
-        df[col] = raw[col].mask(raw[col] == "")
+    return raw.mask(raw == "")
 
 
 def _accepts_only_int(field_type: object) -> bool:
@@ -1239,47 +1644,373 @@ def _int_or_read(text: str, read: object) -> object:
     return read
 
 
-def _reread_int_columns(
-    df: pd.DataFrame, path: Path, ext: str, model: type[BaseModel], kwargs: dict[str, Any]
-) -> None:
-    """Relê como int exato os campos int do modelo, do CSV e do parquet, in-place.
+def _int_as_written(raw: pd.Series, read: pd.Series) -> pd.Series | None:
+    """O int exato do campo int relido do CSV.
 
     O leitor do pandas devolve float64 numa coluna com int e célula vazia, como
     a de um checkpoint com linha pendente, e o float arredonda o int acima de
     2**53; com int acima do Int64, o CSV volta como texto. A coluna relida
     passa a object, com o int que o arquivo guarda como inteiro e None na
     célula que o leitor devolveu ausente, seja vazia ou "NA"; a célula que
-    guarda outra coisa, como 7.5, fica como lida. O XLSX guarda número como
-    double e fica de fora, porque o int que ele devolve já pode vir
-    arredondado. Qualquer argumento de leitura também desliga a releitura,
-    porque ele muda o que o leitor devolve (on_bad_lines pula linhas, dtype
-    fixa tipos, chunksize nem devolve DataFrame), e a releitura sem ele não
-    casaria com o que foi lido.
+    guarda outra coisa, como 7.5, fica como lida. A coluna sem nenhum int fica
+    como lida.
     """
-    if ext not in (".csv", ".parquet") or kwargs:
-        return
-    columns = [
-        f
-        for f, info in model.model_fields.items()
-        if f in df.columns and _accepts_only_int(info.annotation) and not is_integer_dtype(df[f])
+    values = list(map(_int_or_read, raw, read))
+    if not any(type(value) is int for value in values):
+        return None
+    return pd.Series(values, index=read.index, dtype=object)
+
+
+# O texto que o str() dá ao Decimal NaN, quieto ou sinalizador, com sinal e diagnóstico.
+_DECIMAL_NAN_TEXT = re.compile(r"-?s?NaN\d*")
+# O texto com que o checkpoint CSV e XLSX grava o NaN de um campo float.
+_FLOAT_NAN_TEXT = "NaN"
+# O texto "NaN" com um ou mais pares de aspas em volta (`_quoted_nan_text`).
+_QUOTED_NAN_TEXT = re.compile(r'("+)NaN\1')
+
+
+def _decimal_as_written(raw: pd.Series, read: pd.Series, *, every_cell: bool) -> pd.Series | None:
+    """O `Decimal` do campo que o admite, com os dígitos que o arquivo guarda.
+
+    O leitor devolve o `Decimal` como float, que perde o zero do fim e os
+    dígitos além do double (`1.10` volta `1.1`), e devolve ausente o texto do
+    `Decimal` NaN (`_structures_as_json`), como a célula vazia da linha
+    pendente. Com `every_cell`, no campo que só admite `Decimal`, toda célula
+    com número volta `Decimal`. Sem, na união com outro tipo, as células ficam
+    como lidas: o texto de um número não diz qual dos tipos da união o gravou.
+    Nos dois, o texto do NaN volta em texto, e a validação da retomada o
+    devolve ao tipo do campo: o pandas conta o `Decimal` NaN como ausente e
+    levanta com o sinalizador. A coluna relida passa a object, com None na
+    célula ausente; sem nenhuma célula trocada, fica como lida.
+    """
+    is_nan = [_DECIMAL_NAN_TEXT.fullmatch(text) is not None for text in raw]
+    if not every_cell and not any(is_nan):
+        return None
+    values: list[object] = []
+    # As colunas têm o mesmo tamanho, e o strict do zip não muda o resultado.
+    cells = zip(raw, is_nan, read.isna(), read, strict=True)  # pragma: no mutate
+    for text, found, absent, value in cells:
+        if found:
+            values.append(text)
+        elif absent:
+            values.append(None)
+        else:
+            values.append(_decimal_or_text(text) if every_cell else value)
+    if all(value is None for value in values):
+        return None
+    return pd.Series(values, index=read.index, dtype=object)
+
+
+def _decimal_or_text(text: str) -> Decimal | str:
+    """O `Decimal` que o texto guarda, ou o próprio texto, que a validação recusa."""
+    try:
+        return Decimal(text)
+    except InvalidOperation:
+        return text
+
+
+def _float_nan_as_written(raw: pd.Series, read: pd.Series) -> pd.Series | None:
+    """O NaN do campo que admite `float`, que o checkpoint grava como o texto "NaN".
+
+    O leitor devolve esse texto ausente, como a célula vazia da linha pendente
+    e da resposta None. No campo que também admite texto, o checkpoint grava
+    com um par de aspas a mais o texto "NaN" que o modelo devolveu
+    (`_quoted_nan_text`), e ele volta sem esse par. A coluna com um dos dois
+    passa a object, com o NaN na célula do texto "NaN", None na ausente e as
+    demais como lidas; sem nenhum, fica como lida.
+    """
+    is_nan = raw == _FLOAT_NAN_TEXT
+    is_quoted = [_QUOTED_NAN_TEXT.fullmatch(text) is not None for text in raw]
+    if not is_nan.any() and not any(is_quoted):
+        return None
+    values: list[object] = []
+    # As colunas têm o mesmo tamanho, e o strict do zip não muda o resultado.
+    cells = zip(raw, is_nan, is_quoted, read.isna(), read, strict=True)  # pragma: no mutate
+    for text, found, quoted, absent, value in cells:
+        if found:
+            values.append(math.nan)
+        elif quoted:
+            values.append(text[1:-1])
+        else:
+            values.append(None if absent else value)
+    return pd.Series(values, index=read.index, dtype=object)
+
+
+def _quoted_nan_text(text: str) -> str:
+    """O texto de um campo que admite `float` como o checkpoint CSV e XLSX o grava.
+
+    O texto "NaN" sem aspas é o NaN do campo. O texto "NaN" que o modelo
+    devolveu num campo que também admite texto vai com um par de aspas, e o que
+    já tem aspas em volta, com um par a mais, para voltar o mesmo
+    (`_float_nan_as_written`). Qualquer outro texto vai como está.
+    """
+    return f'"{text}"' if _QUOTED_NAN_TEXT.fullmatch(f'"{text}"') else text
+
+
+# O começo de todo texto que `_scalar_or_read` troca por número ou bool.
+_SCALAR_START = re.compile(r"[-+.\d]|(?:True|False)$|(?i:inf|nan)")
+
+
+def _holds_cell_to_restore(read: pd.Series, *, scalars: bool, unquote: bool) -> bool:
+    """Se alguma célula da coluna pode voltar outra do texto cru (`_scalars_as_written`).
+
+    Erra para o lado de dizer que sim: a célula ausente, o texto que começa
+    com aspas e o que começa como um número ou um bool. A checagem é
+    vetorizada e poupa a releitura do arquivo e o laço das células na coluna
+    só de texto comum, como a de um campo `Any` que recebeu frases.
+    """
+    if read.isna().any():
+        return True
+    if not (scalars or unquote):
+        return False
+    cells = read.astype(str)
+    return bool(
+        (unquote and cells.str.startswith('"').any())
+        or (scalars and cells.str.match(_SCALAR_START).any())
+    )
+
+
+def _inside_quotes(text: str) -> str:
+    """O que fica dentro de todos os pares de aspas em volta do texto."""
+    pairs = 0
+    while len(text) >= 2 * (pairs + 1) and text[pairs] == text[-pairs - 1] == '"':
+        pairs += 1
+    return text[pairs : len(text) - pairs]
+
+
+def _quoted_scalar_text(text: str) -> str:
+    """O texto da união de texto e número como o checkpoint CSV e XLSX o grava.
+
+    O texto que o leitor devolveria como número, bool ou ausência
+    (`_reads_as_other`), como "123", "N/A" e "", vai com um par de aspas, e o
+    que já tem aspas em volta de um texto desses, com um par a mais, para
+    voltar o mesmo (`_unquoted_scalar_text`). Qualquer outro vai como está. A
+    célula sem aspas que se lê como número é o número que o modelo devolveu.
+    """
+    return f'"{text}"' if _reads_as_other(_inside_quotes(text)) else text
+
+
+def _unquoted_scalar_text(text: str) -> str | None:
+    """O texto que `_quoted_scalar_text` gravou com um par de aspas a mais, ou None."""
+    inner = _inside_quotes(text)
+    return text[1:-1] if inner != text and _reads_as_other(inner) else None
+
+
+def _scalars_as_written(
+    raw: pd.Series,
+    read: pd.Series,
+    *,
+    scalars: bool,
+    nan: bool,
+    admitted: Collection[type] | None,
+) -> pd.Series | None:
+    """A coluna do campo `Any`, ou da união de texto e número, como o checkpoint a gravou.
+
+    O checkpoint grava entre aspas o texto que o leitor devolveria como
+    número, bool ou ausência (`_structures_as_json`), e a célula sem aspas que
+    se lê assim é o que o modelo devolveu. Com `nan`, o texto "NaN" é o NaN do
+    campo. A célula que o leitor devolveu ausente, vazia ou não, volta None.
+    Na coluna de texto da união, a que tem `admitted`, o texto gravado entre
+    aspas volta sem elas (`_unquoted_scalar_text`); o do `Any` é JSON, que
+    `_normalize_any_columns` lê. Com `scalars`, no CSV, cujo leitor tipa a
+    coluna inteira, o 5 e o True ao lado de um texto, lidos "5" e "True",
+    voltam número e bool. Com `admitted`, as classes de número da união, só
+    volta o número de uma delas e escrito como o CSV o grava: o "1.5" de uma
+    união sem float e o "007" são textos de um arquivo que não veio do
+    checkpoint, ou veio de antes das aspas, e ficam como lidos. As demais
+    células ficam como lidas.
+
+    A coluna sem célula trocada fica como lida; a ausente só conta como
+    trocada na coluna de texto, e a de números sem NaN segue float64.
+    """
+    in_text_column = is_string_dtype(read.dtype)
+    unquote = in_text_column and admitted is not None
+    values: list[object] = []
+    changed = False
+    # As colunas têm o mesmo tamanho, e o strict do zip não muda o resultado.
+    cells = zip(raw, read.isna(), read, strict=True)  # pragma: no mutate
+    for text, absent, value in cells:
+        new = value
+        if nan and text == _FLOAT_NAN_TEXT:
+            new = math.nan
+            changed = True
+        elif absent:
+            new = None
+            changed = changed or in_text_column
+        elif unquote and (unquoted := _unquoted_scalar_text(text)) is not None:
+            new = unquoted
+            changed = True
+        elif scalars:
+            new = _scalar_or_read(text, value)
+            if admitted is not None and not (type(new) in admitted and str(new) == text):
+                new = value
+            changed = changed or new is not value
+        values.append(new)
+    return pd.Series(values, index=read.index, dtype=object) if changed else None
+
+
+def _scalar_or_read(text: str, read: object) -> object:
+    """O int, o float ou o bool que o texto cru da célula guarda, ou o valor lido."""
+    if _INT_TEXT.fullmatch(text):
+        return int(text)
+    if text in ("True", "False"):
+        return text == "True"
+    if text in _READER_NA_TEXTS or text != text.strip():
+        return read
+    try:
+        return float(text)
+    except ValueError:
+        return read
+
+
+def _reread_parquet(df: pd.DataFrame, path: Path, model: type[BaseModel]) -> set[str]:
+    """Relê do parquet o int exato e o NaN à parte do nulo, in-place; devolve as colunas trocadas.
+
+    O leitor do pandas devolve float64 numa coluna de int com célula nula, que
+    arredonda o int acima de 2**53, e numa coluna de float devolve NaN também
+    na célula nula. O parquet guarda o int e o nulo à parte, e a leitura com
+    os tipos do Arrow os separa. A coluna de campo int que o arquivo guarda
+    como inteiro passa a object, com o int exato e None na célula nula. A do
+    campo que admite `float`, ou do campo `Any`, com algum NaN passa a object,
+    com o NaN e None; sem NaN, fica como lida, com o nulo em NaN.
+    """
+    ints = [
+        name
+        for name, info in model.model_fields.items()
+        if name in df.columns
+        and _accepts_only_int(info.annotation)
+        and not is_integer_dtype(df[name])
     ]
-    if not columns:
-        return
-    if ext == ".parquet":
-        raw = pd.read_parquet(path, columns=columns, dtype_backend="numpy_nullable")
-        exact = {
-            col: [None if pd.isna(v) else int(v) for v in raw[col]]
-            for col in columns
-            if is_integer_dtype(raw[col])
-        }
-    else:
-        raw = pd.read_csv(path, usecols=columns, dtype=str, na_filter=False)
-        exact = {
-            col: [_int_or_read(text, read) for text, read in zip(raw[col], df[col], strict=True)]
-            for col in columns
-        }
-    for col, values in exact.items():
-        if any(type(v) is int for v in values):
+    floats = [
+        name
+        for name, info in model.model_fields.items()
+        if name in df.columns
+        and (_keeps_nan(info.annotation) or _admits_any(info.annotation))
+        and is_float_dtype(df[name])
+    ]
+    changed: set[str] = set()
+    if not ints and not floats:
+        return changed
+    # O columns só poupa a leitura das outras colunas, que a releitura não usa.
+    raw = pd.read_parquet(
+        path,
+        columns=ints + floats,  # pragma: no mutate
+        dtype_backend="pyarrow",
+    )
+    for col in ints:
+        if is_integer_dtype(raw[col]):
+            values = [None if pd.isna(value) else int(value) for value in raw[col]]
+            if any(value is not None for value in values):
+                df[col] = pd.Series(values, index=df.index, dtype=object)
+                changed.add(col)
+    for col in floats:
+        # O isna da coluna do Arrow só acusa o nulo, e o NaN fica entre os
+        # valores: com o nulo trocado por zero, o que resta de NaN é valor.
+        if is_float_dtype(raw[col]):
+            without_null = raw[col].to_numpy(
+                na_value=0.0,  # pragma: no mutate (qualquer número serve no lugar do nulo)
+            )
+            if pd.isna(without_null).any():
+                df[col] = pd.Series(raw[col].to_numpy(dtype=object, na_value=None), index=df.index)
+                changed.add(col)
+    return changed
+
+
+# Os textos que o leitor do pandas devolve ausentes por padrão (o `na_values`
+# de read_csv e read_excel). Lista própria, porque o pandas não a expõe na API
+# pública; um teste a compara com a do pandas instalado.
+_READER_NA_TEXTS = frozenset(
+    {
+        "",
+        "#N/A",
+        "#N/A N/A",
+        "#NA",
+        "-1.#IND",
+        "-1.#QNAN",
+        "-NaN",
+        "-nan",
+        "1.#IND",
+        "1.#QNAN",
+        "<NA>",
+        "N/A",
+        "NA",
+        "NULL",
+        "NaN",
+        "None",
+        "n/a",
+        "nan",
+        "null",
+    }
+)
+
+
+def _reads_as_other(text: str) -> bool:
+    """Se o leitor do CSV ou do XLSX devolveria o texto como número, bool ou ausência.
+
+    Erra para o lado de dizer que sim, como no texto com espaços em volta de
+    um número, que só o leitor do CSV converte: o texto acusado é gravado entre
+    aspas (`_structures_as_json`) e volta o mesmo.
+    """
+    stripped = text.strip()
+    if not stripped or stripped in _READER_NA_TEXTS or stripped.casefold() in ("true", "false"):
+        return True
+    try:
+        float(stripped)
+    except ValueError:
+        return False
+    return True
+
+
+def _any_from_text(text: str) -> object:
+    """O valor que o checkpoint gravou num campo `Any` como o texto `text`.
+
+    O checkpoint grava em JSON a lista, o dict e a tupla de um campo `Any`, e o
+    texto que se leria como uma dessas estruturas, ou como texto JSON entre
+    aspas, ele grava como texto JSON (`_structures_as_json`): assim todo texto
+    volta o mesmo, e só a estrutura volta estrutura. O texto que não é nenhum
+    dos dois volta ele mesmo.
+    """
+    if text.startswith('"'):
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            return text
+        return decoded if isinstance(decoded, str) else text
+    return normalize_value(text)
+
+
+def _normalize_any_columns(
+    df: pd.DataFrame, model: type[BaseModel], nan_is_value: Collection[str] = ()
+) -> None:
+    """Devolve às colunas de campo `Any` do modelo o que o checkpoint gravou em JSON, in-place.
+
+    A coluna de texto em que algum texto volta outro valor (`_any_from_text`)
+    ou alguma célula é ausente passa a object, com None na célula ausente: o
+    NaN que o leitor põe nela não se separa, na coluna de objetos, do NaN que
+    o modelo devolveu. Nas colunas de `nan_is_value`, que a releitura já
+    trocou (`_reread_as_written`), a ausente já é None, e o NaN é o que o
+    modelo devolveu e fica. A coluna sem esses textos nem ausentes fica como
+    lida, com o tipo que o leitor deu.
+    """
+    for col, info in model.model_fields.items():
+        if (
+            col not in df.columns
+            or not _admits_any(info.annotation)
+            or not is_string_dtype(df[col].dtype)
+        ):
+            continue
+        # Uma lista só: a coluna `str` do pandas 3 cria outro objeto a cada leitura.
+        cells = list(df[col])
+        # As listas têm o tamanho da coluna, e o strict do zip não muda o resultado.
+        absent = [cell is None for cell in cells] if col in nan_is_value else df[col].isna()
+        marked = zip(cells, absent, strict=True)  # pragma: no mutate
+        values = [
+            None if missing else _any_from_text(cell) if isinstance(cell, str) else cell
+            for cell, missing in marked
+        ]
+        # O texto que volta ele mesmo é o próprio objeto lido.
+        restored = zip(values, cells, strict=True)  # pragma: no mutate
+        if any(new is not cell for new, cell in restored):
             df[col] = pd.Series(values, index=df.index, dtype=object)
 
 
@@ -1310,16 +2041,19 @@ def _normalize_all_json_columns(df: pd.DataFrame) -> None:
 
 
 def _unwrapped(annotation: object) -> object:
-    """Um nível da anotação sem o `Annotated`, que só acrescenta metadados ao tipo.
+    """Um nível da anotação sem o `Annotated`, o NewType e o apelido `type`.
 
     É o ponto único em que os helpers de modelo aninhado abaixo desembrulham
     cada nível da anotação antes de olhar a origem e os argumentos: todos
     passam por `_value_types`, que o chama. O Pydantic tira o `Annotated` só do
     nível de cima da anotação do campo; dentro de Optional, de união ou de
-    lista ele fica, e os metadados dele nunca são percorridos como tipo.
+    lista ele fica, e os metadados dele nunca são percorridos como tipo. O
+    NewType e o apelido `type` valem o tipo a que se referem (`_resolved`), em
+    volta do `Annotated` e dentro dele.
     """
-    if get_origin(annotation) is typing.Annotated:
-        return get_args(annotation)[0]
+    annotation = _resolved(annotation)
+    while get_origin(annotation) is typing.Annotated:
+        annotation = _resolved(get_args(annotation)[0])
     return annotation
 
 
@@ -1423,6 +2157,18 @@ def list_layers(annotation: object, target: type) -> int | None:
     ou, quando o item pode ser mais de um modelo, uma vez para a linha.
     Devolve None quando `target` não aparece.
     """
+    return _layers(annotation, target, ())
+
+
+def _layers(annotation: object, target: type, seen: tuple[object, ...]) -> int | None:
+    """As camadas de `list_layers`, sem voltar a uma anotação em que a descida já está.
+
+    O apelido `type` recursivo, como `type Arvore = list[Arvore] | Item`, chega
+    de novo a uma das anotações de `seen`, que não é percorrida outra vez.
+    """
+    if annotation in seen:
+        return None
+    seen = (*seen, annotation)
     depths = []
     for value_type in _value_types(annotation):
         if value_type is target:
@@ -1431,7 +2177,7 @@ def list_layers(annotation: object, target: type) -> int | None:
         item_types = _item_types(value_type)
         layer = 1 if item_types else 0
         for inner in item_types or get_args(value_type):
-            depth = list_layers(inner, target)
+            depth = _layers(inner, target, seen)
             if depth is not None:
                 depths.append(depth + layer)
     return max(depths, default=None)
@@ -1545,6 +2291,7 @@ def resolve_forward_refs(  # noqa: PLR0911 (uma saída por forma de anotação)
 
     origin = get_origin(annotation)
     args = get_args(annotation)
+    _refuse_shadowed_name(annotation, owner)
     # Em Literal os argumentos são valores, e uma string ali nunca é referência.
     if origin is None or origin is typing.Literal or not args:
         return annotation
@@ -1590,14 +2337,27 @@ def get_nested_pydantic_models(field_type: object) -> list[type[BaseModel]]:
         >>> get_nested_pydantic_models(str)
         []
     """
+    return list(dict.fromkeys(_nested_models(field_type, ())))
+
+
+def _nested_models(annotation: object, seen: tuple[object, ...]) -> list[type[BaseModel]]:
+    """Os modelos da anotação, na ordem em que aparecem e com repetição.
+
+    `seen` são as anotações em que a descida já está: o apelido `type`
+    recursivo, como `type Json = dict[str, Json] | list[Json] | str`, chega de
+    novo a uma delas, que não é percorrida outra vez.
+    """
+    if annotation in seen:
+        return []
+    seen = (*seen, annotation)
     models = []
-    for value_type in _value_types(field_type):
+    for value_type in _value_types(annotation):
         if _is_pydantic_model(value_type):
             models.append(value_type)
         else:
             for arg in get_args(value_type):
-                models.extend(get_nested_pydantic_models(arg))
-    return list(dict.fromkeys(models))
+                models.extend(_nested_models(arg, seen))
+    return models
 
 
 # As funções públicas de core.py, cuja chamada os avisos apontam.
@@ -1619,6 +2379,16 @@ def _user_stacklevel() -> int:  # pragma: no mutate block
             frame.f_code.co_name in _ENTRY_POINTS
             and frame.f_globals.get("__name__") == f"{__package__}.core"
         ):
+            return level + 1
+        if (
+            frame.f_code.co_name == "x_dataframeit__mutmut_orig"
+            and frame.f_globals.get("__name__") == f"{__package__}.core"
+        ):
+            while frame.f_back is not None and frame.f_back.f_code.co_name in {
+                "trampoline",
+                "_trampoline_wrapper",
+            }:
+                frame, level = frame.f_back, level + 1
             return level + 1
         frame, level = frame.f_back, level + 1
     return 1

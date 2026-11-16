@@ -7,13 +7,16 @@ import threading
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Generic, NoReturn, TypedDict, TypeVar, cast
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.exceptions import OutputParserException
 from pydantic import BaseModel, ValidationError
+from typing_extensions import override
 
 from .errors import (
     MAX_REJECTED_RULES,
     ProviderRejectedOutputError,
     aretry_with_backoff,
+    dump_response,
     retry_with_backoff,
     validation_error_summary,
 )
@@ -22,6 +25,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from langchain_core.language_models import BaseChatModel
+    from langchain_core.outputs import LLMResult
     from langchain_core.runnables import Runnable
 
 T = TypeVar("T")
@@ -155,6 +159,32 @@ class Usage(TypedDict, total=False):
     cost_usd: float
 
 
+@dataclass(frozen=True)
+class _FailedCallUsage:
+    error: BaseException
+    usage: Usage
+    cost_usd: float = 0.0
+
+
+_failed_call_usage = threading.local()
+
+
+def _clear_failed_usage() -> None:
+    _failed_call_usage.value = None
+
+
+def _set_failed_usage(error: BaseException, usage: Usage, cost_usd: float = 0.0) -> None:
+    """Guarda o gasto no worker, separado de exceções que um SDK pode reutilizar."""
+    _failed_call_usage.value = _FailedCallUsage(error, cast("Usage", dict(usage)), cost_usd)
+
+
+def _take_failed_usage(error: BaseException) -> _FailedCallUsage | None:
+    """Lê e limpa apenas o gasto da falha atual neste worker."""
+    value = getattr(_failed_call_usage, "value", None)
+    _failed_call_usage.value = None
+    return value if value is not None and value.error is error else None
+
+
 # Contadores de tokens, os que toda chamada ao LLM informa e o resumo soma.
 _TOKEN_KEYS = (
     "input_tokens",
@@ -203,6 +233,30 @@ def _parse_usage_metadata(meta: object) -> Usage:
         "total_tokens": total_tokens,
         "reasoning_tokens": reasoning_tokens,
     }
+
+
+class _ParserUsageCapture(BaseCallbackHandler):
+    """Guarda o uso da resposta quando o parser levanta antes de devolvê-la.
+
+    `run_inline`: no `ainvoke`, o LangChain chama o handler síncrono no próprio
+    event loop, e não por `run_in_executor`, numa thread, que o modo
+    assíncrono (e o Pyodide) não tem. No `invoke`, nada muda.
+    """
+
+    run_inline = True
+
+    def __init__(self) -> None:
+        self.usage: Usage = {}
+        self._lock = threading.Lock()
+
+    @override
+    def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
+        for generations in response.generations:
+            for generation in generations:
+                metadata = getattr(getattr(generation, "message", None), "usage_metadata", None)
+                if metadata is not None:
+                    with self._lock:
+                        _add_usage(self.usage, _parse_usage_metadata(metadata))
 
 
 def with_shared_chat_model(config: LLMConfig) -> LLMConfig:
@@ -254,7 +308,9 @@ class _Attempts:
         """O que a próxima tentativa manda ao modelo."""
         return _messages(self.prompt, self.correction)
 
-    def reject(self, error: ValidationError | OutputParserException) -> NoReturn:
+    def reject(
+        self, error: ValidationError | OutputParserException, capture: _ParserUsageCapture
+    ) -> NoReturn:
         """Trata a resposta que a chamada ao modelo recusou antes de devolvê-la."""
         if isinstance(error, ValidationError):
             # O SDK da OpenAI valida a resposta dentro da chamada (json_schema e
@@ -262,24 +318,34 @@ class _Attempts:
             # do próprio modelo é resposta recusada: um ValidationError de outro
             # modelo, como a configuração do provider, segue como erro comum.
             if error.title != _model_title(self.pydantic_model):
+                _add_usage(self.usage_total, capture.usage)
                 raise error
             raw_text, usage = _sdk_rejected_response(error)
-            _add_usage(self.usage_total, usage)
+            _add_usage(self.usage_total, usage if usage is not None else capture.usage)
             _request_correction(
                 self.pydantic_model, None, error, self.correction, raw_text=raw_text
             )
         # Resposta sem tool call quando o modelo não aceita tool_choice forçado,
         # ou com thinking na Anthropic: o parser levanta dentro da chamada.
         # Sem llm_output, o texto do erro é aviso interno do LangChain, que não
-        # ajuda o modelo; o pedido fica o genérico de formato. O uso dessa
-        # tentativa não chega até aqui.
+        # ajuda o modelo; o pedido fica o genérico de formato. O callback
+        # recebe o uso mesmo quando o parser não devolve a mensagem.
+        _add_usage(self.usage_total, capture.usage)
         _request_correction(
             self.pydantic_model,
             None,
-            error if error.llm_output else None,
+            error if bool(error.llm_output) else None,
             self.correction,
             raw_text=str(error.llm_output or ""),
         )
+
+    def charge(self, capture: _ParserUsageCapture) -> None:
+        """Soma o uso de uma chamada que falhou sem devolver o dict `raw`.
+
+        O modelo pode devolver uma resposta cobrada antes de um validador da
+        cadeia levantar.
+        """
+        _add_usage(self.usage_total, capture.usage)
 
     def parse(self, result: dict[str, Any]) -> dict[str, Any]:
         """Soma o uso da resposta e devolve os dados, ou pede correção se ela não valida."""
@@ -295,7 +361,16 @@ class _Attempts:
         if parsed is None:
             _request_correction(self.pydantic_model, raw_message, None, self.correction)
 
-        return {"data": parsed.model_dump(by_alias=False), "usage": dict(self.usage_total) or None}
+        return {"data": dump_response(parsed), "usage": dict(self.usage_total) or None}
+
+    def on_failure(self, error: Exception) -> None:
+        """Anexa à exceção final o uso das tentativas cuja resposta chegou.
+
+        A linha falhou, mas essas tentativas foram cobradas, e o core soma o
+        uso ao resumo.
+        """
+        error.row_usage = self.usage_total  # ty: ignore[unresolved-attribute]
+        _set_failed_usage(error, self.usage_total)
 
 
 def _structured_model(
@@ -333,19 +408,23 @@ def call_langchain(
     attempts = _Attempts(text, pydantic_model, user_prompt)
 
     def _call() -> dict[str, Any]:
+        capture = _ParserUsageCapture()
         try:
-            result = model.invoke(attempts.messages())
+            result = model.invoke(attempts.messages(), config={"callbacks": [capture]})
         except (ValidationError, OutputParserException) as error:
-            attempts.reject(error)
+            attempts.reject(error, capture)
+        except Exception:
+            attempts.charge(capture)
+            raise
         return attempts.parse(result)
 
-    try:
-        return retry_with_backoff(_call, config.max_retries, config.base_delay, config.max_delay)
-    except Exception as error:
-        # A linha falhou, mas as tentativas cuja resposta chegou foram cobradas;
-        # o core soma esse uso ao resumo. Atributo dinâmico, lido com getattr.
-        error.row_usage = attempts.usage_total  # ty: ignore[unresolved-attribute]
-        raise
+    return retry_with_backoff(
+        _call,
+        config.max_retries,
+        config.base_delay,
+        config.max_delay,
+        on_failure=attempts.on_failure,
+    )
 
 
 async def acall_langchain(
@@ -365,20 +444,23 @@ async def acall_langchain(
     attempts = _Attempts(text, pydantic_model, user_prompt)
 
     async def _call() -> dict[str, Any]:
+        capture = _ParserUsageCapture()
         try:
-            result = await model.ainvoke(attempts.messages())
+            result = await model.ainvoke(attempts.messages(), config={"callbacks": [capture]})
         except (ValidationError, OutputParserException) as error:
-            attempts.reject(error)
+            attempts.reject(error, capture)
+        except Exception:
+            attempts.charge(capture)
+            raise
         return attempts.parse(result)
 
-    try:
-        return await aretry_with_backoff(
-            _call, config.max_retries, config.base_delay, config.max_delay
-        )
-    except Exception as error:
-        # Ver call_langchain.
-        error.row_usage = attempts.usage_total  # ty: ignore[unresolved-attribute]
-        raise
+    return await aretry_with_backoff(
+        _call,
+        config.max_retries,
+        config.base_delay,
+        config.max_delay,
+        on_failure=attempts.on_failure,
+    )
 
 
 def _model_title(pydantic_model: type[BaseModel]) -> str:
@@ -386,9 +468,7 @@ def _model_title(pydantic_model: type[BaseModel]) -> str:
     return pydantic_model.model_config.get("title") or pydantic_model.__name__
 
 
-def _add_usage(total: Usage, usage: Usage | None) -> None:
-    if usage is None:
-        return
+def _add_usage(total: Usage, usage: Usage) -> None:
     for key in _TOKEN_KEYS:
         total[key] = total.get(key, 0) + (usage.get(key) or 0)
 
@@ -579,11 +659,11 @@ def _create_langchain_llm(
     # `temperature` com erro 400, e a lista muda a cada lançamento. Quem quer
     # determinismo passa `temperature` em `model_kwargs`, nos modelos que aceitam.
     kwargs: dict[str, Any] = {"model_provider": provider}
-    if api_key:
+    if bool(api_key):
         kwargs["api_key"] = api_key
 
     # Adicionar parâmetros extras do usuário
-    if extra_kwargs:
+    if bool(extra_kwargs):
         kwargs.update(extra_kwargs)
 
     # Com model=None o LangChain devolve um modelo configurável; aqui model só é

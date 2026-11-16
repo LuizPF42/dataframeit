@@ -1,13 +1,16 @@
 """O que cada linha grava, a contagem do checkpoint e o resumo, nos dois modos."""
 
+import linecache
 import logging
 import re
 import threading
 import time
+import warnings
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -354,32 +357,25 @@ def test_handler_de_reserva_e_instalado_uma_vez():
 
 
 class _Barra:
-    """Registra o rótulo, o total e os avanços da barra de progresso."""
+    """Registra o rótulo, o total, os avanços e o fechamento da barra de progresso."""
 
     criadas: list[Any]
 
-    def __init__(self, iterable=None, total=None, desc=None):
-        self.iterable, self.total, self.desc, self.n = iterable, total, desc, 0
+    def __init__(self, total=None, desc=None):
+        self.total, self.desc, self.n = total, desc, 0
+        self.fechada = False
         _Barra.criadas.append(self)
-
-    def __iter__(self):
-        for item in self.iterable or ():
-            self.n += 1
-            yield item
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
 
     def update(self, passos):
         self.n += passos
 
+    def close(self):
+        self.fechada = True
 
-def _barra(monkeypatch):
+
+def _barra(monkeypatch, classe=_Barra):
     _Barra.criadas = []
-    monkeypatch.setattr(core, "tqdm", _Barra)
+    monkeypatch.setattr(core, "tqdm", classe)
     return _Barra.criadas
 
 
@@ -398,6 +394,206 @@ def test_barra_do_paralelo_mostra_total_e_reprocessamento(monkeypatch):
     [barra] = barras
     assert barra.desc == "Processando [pandas+langchain] [2 workers] (reprocessando: campo1)"
     assert (barra.total, barra.n) == (3, 3)
+
+
+@pytest.mark.parametrize(
+    ("erro", "esperado"),
+    [
+        (ProviderAbortError("sem crédito"), pytest.warns(UserWarning, match="sem crédito")),
+        (KeyboardInterrupt(), pytest.raises(KeyboardInterrupt)),
+    ],
+    ids=["erro_que_interrompe", "ctrl_c"],
+)
+@pytest.mark.parametrize("paralelo", [1, 2])
+def test_barra_fecha_quando_a_execucao_e_interrompida(monkeypatch, paralelo, erro, esperado):
+    barras = _barra(monkeypatch)
+
+    with esperado:
+        _roda(["a", "b", "c"], _llm({"b": erro}), parallel_requests=paralelo, track_tokens=False)
+
+    assert [barra.fechada for barra in barras] == [True]
+
+
+def _barra_que_falha(monkeypatch, ponto):
+    """Barra cuja criação, avanço ou fechamento levanta BrokenPipeError, conforme o ponto.
+
+    Devolve as barras criadas e o llm das linhas "a" e "b", em que "b" levanta
+    o erro pedido. No modo paralelo, quando a falha é no avanço, "b" espera o
+    avanço de "a": sem isso, as duas podiam terminar juntas, e a interrupção
+    sair antes dele.
+    """
+    avancou = threading.Event()
+
+    def falha(onde):
+        if onde in ponto:
+            raise BrokenPipeError(32, "Broken pipe")
+
+    class _BarraQueFalha(_Barra):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.avancos = self.fechamentos = 0
+            falha("criar")
+
+        @override
+        def update(self, passos):
+            self.avancos += 1
+            avancou.set()
+            falha("avancar")
+            super().update(passos)
+
+        @override
+        def close(self):
+            self.fechamentos += 1
+            falha("fechar")
+            super().close()
+
+    def llm(erro):
+        respostas = _llm({"b": erro} if erro else None)
+
+        def responde(text, *args, **kwargs):
+            if text == "b" and erro and "avancar" in ponto:
+                assert avancou.wait(timeout=10)
+            return respostas(text)
+
+        return responde
+
+    return _barra(monkeypatch, _BarraQueFalha), llm
+
+
+_FINS = pytest.mark.parametrize(
+    "fim",
+    [(KeyboardInterrupt(), None), (ProviderAbortError("sem crédito"), None), (None, "processed")],
+    ids=["ctrl_c", "erro_que_interrompe", "fim_normal"],
+)
+
+
+def _linha_pendente_e_linha_com_erro():
+    return pd.DataFrame(
+        {
+            "texto": ["a", "b"],
+            "_dataframeit_status": [None, "error"],
+            "_error_details": [None, "x"],
+        }
+    )
+
+
+def _confere_gravado(ckpt, segunda):
+    gravado = pd.read_csv(ckpt).astype(object).where(pd.notna, None)
+    assert gravado["_dataframeit_status"].tolist() == ["processed", segunda]
+    assert gravado["_error_details"].tolist() == [None, None]
+
+
+_PONTOS = pytest.mark.parametrize("ponto", ["criar", "avancar", "fechar", "avancar_e_fechar"])
+_AVISO_DA_BARRA = (
+    "Falha na barra de progresso, que não interrompeu a execução: "
+    "BrokenPipeError: [Errno 32] Broken pipe"
+)
+
+
+@_PONTOS
+@_FINS
+@pytest.mark.parametrize("paralelo", [1, 2])
+def test_falha_da_barra_vira_um_aviso_e_nao_troca_o_resultado_nem_a_interrupcao(
+    monkeypatch, tmp_path, paralelo, fim, ponto
+):
+    """A barra falha, e a execução termina ou é interrompida na segunda linha.
+
+    O resultado ou o Ctrl-C chegam a quem chamou, com um aviso só. A primeira
+    linha, já registrada, e a segunda, que tinha erro e ia ser refeita, chegam
+    ao arquivo; a interrompida vai sem status. A barra que falhou ao avançar
+    ainda é fechada.
+    """
+    erro, segunda = fim
+    barras, llm = _barra_que_falha(monkeypatch, ponto)
+    ckpt = tmp_path / "c.csv"
+    interrompe = pytest.raises(KeyboardInterrupt) if isinstance(erro, KeyboardInterrupt) else None
+
+    resultado = None
+    with warnings.catch_warnings(record=True) as avisos, interrompe or nullcontext() as excinfo:
+        warnings.simplefilter("always")
+        resultado = _roda(
+            _linha_pendente_e_linha_com_erro(),
+            llm(erro),
+            resume=False,
+            parallel_requests=paralelo,
+            batch_size=10,
+            checkpoint_path=ckpt,
+        )
+
+    if excinfo:
+        assert excinfo.value.__context__ is None
+    else:
+        assert resultado is not None
+        assert resultado["campo1"].tolist() == ["a", "b" if segunda else None]
+    assert [str(aviso.message) for aviso in avisos if "barra" in str(aviso.message)] == [
+        _AVISO_DA_BARRA
+    ]
+    [barra] = barras
+    if ponto == "criar":
+        assert (barra.avancos, barra.fechamentos) == (0, 0)
+    else:
+        assert barra.fechamentos == 1
+    _confere_gravado(ckpt, segunda)
+
+
+@_PONTOS
+@_FINS
+@pytest.mark.parametrize("paralelo", [1, 2])
+def test_aviso_da_barra_tratado_como_erro_sai_depois_das_marcas_e_da_gravacao(
+    monkeypatch, tmp_path, paralelo, fim, ponto
+):
+    """O aviso da falha levanta, e só na saída: a barra é o último bloco a fechar."""
+    erro, segunda = fim
+    _barras, llm = _barra_que_falha(monkeypatch, ponto)
+    ckpt = tmp_path / "c.csv"
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message="Falha na barra de progresso")
+        warnings.filterwarnings("ignore", message="Execução interrompida")
+        with pytest.raises(UserWarning) as excinfo:
+            _roda(
+                _linha_pendente_e_linha_com_erro(),
+                llm(erro),
+                resume=False,
+                parallel_requests=paralelo,
+                batch_size=10,
+                checkpoint_path=ckpt,
+            )
+
+    assert str(excinfo.value) == _AVISO_DA_BARRA
+    assert isinstance(excinfo.value.__context__, KeyboardInterrupt) == isinstance(
+        erro, KeyboardInterrupt
+    )
+    _confere_gravado(ckpt, segunda)
+
+
+@pytest.mark.parametrize("paralelo", [1, 2])
+def test_tqdm_com_a_saida_quebrada_no_meio_da_execucao_nao_troca_o_resultado(monkeypatch, paralelo):
+    """O tqdm de verdade escreve numa saída que passa a levantar BrokenPipeError."""
+
+    class _SaidaQueQuebra:
+        quebrada = False
+
+        def write(self, texto):
+            if self.quebrada:
+                raise BrokenPipeError(32, "Broken pipe")
+            return len(texto)
+
+        def flush(self):
+            pass
+
+    saida = _SaidaQueQuebra()
+    monkeypatch.setattr(core, "tqdm", partial(core.tqdm, file=saida))
+    respostas = _llm()
+
+    def llm(text, *args, **kwargs):
+        saida.quebrada = True
+        return respostas(text)
+
+    with pytest.warns(UserWarning, match=re.escape(_AVISO_DA_BARRA)):
+        resultado = _roda(["a"], llm, parallel_requests=paralelo, track_tokens=False)
+
+    assert resultado["campo1"].tolist() == ["a"]
 
 
 @pytest.mark.parametrize("paralelo", [1, 2])
@@ -566,16 +762,32 @@ def test_rate_limit_reduz_os_workers_pela_metade(monkeypatch, capsys):
     ]
     # O aviso aponta a chamada de dataframeit, e não o interior da lib.
     assert final[0].filename == __file__
+    reducoes = [a for a in avisos if "Reduzindo workers" in str(a.message)]
+    assert len(reducoes) == 1
+    assert reducoes[0].filename == __file__
+    assert "dataframeit(" in linecache.getline(reducoes[0].filename, reducoes[0].lineno)
     assert capsys.readouterr().out == ""
     assert saida["_error_details"].iloc[0].endswith("ProviderOverloadedError: 429")
 
 
-def test_erro_sem_texto_legivel_nao_conta_como_rate_limit():
+@pytest.mark.parametrize("parallel_requests", [1, 2])
+def test_erro_sem_texto_legivel_nao_conta_como_rate_limit(parallel_requests):
     with pytest.warns(UserWarning, match="Falha ao processar linha 0") as avisos:
-        saida = _roda(["a", "b"], _llm({"a": _ErroIlegivel()}), parallel_requests=2)
+        saida = _roda(["a", "b"], _llm({"a": _ErroIlegivel()}), parallel_requests=parallel_requests)
 
     assert saida["_dataframeit_status"].tolist() == ["error", "processed"]
     assert not [a for a in avisos if "workers" in str(a.message).lower()]
+    assert avisos[0].filename == __file__
+    assert "dataframeit(" in linecache.getline(avisos[0].filename, avisos[0].lineno)
+
+
+def test_aviso_da_thread_respeita_filtro_de_modulo():
+    with warnings.catch_warnings(record=True) as filtrados:
+        warnings.simplefilter("always")
+        warnings.filterwarnings("ignore", message=r"Falha ao processar linha 0", module=__name__)
+        _roda(["a"], _llm({"a": ValueError("falhou")}), parallel_requests=2)
+
+    assert not [aviso for aviso in filtrados if "Falha ao processar linha 0" in str(aviso.message)]
 
 
 # Modo sequencial
@@ -596,6 +808,25 @@ def test_barra_do_sequencial_mostra_ritmo_reprocessamento_e_total(monkeypatch):
 
     [barra] = barras
     assert barra.desc == "Processando [pandas+langchain] [~60 req/min] (reprocessando: campo1)"
+    assert (barra.total, barra.n) == (3, 3)
+
+
+def test_barra_do_sequencial_conta_a_linha_que_ja_estava_processada(monkeypatch):
+    barras = _barra(monkeypatch)
+    df = pd.DataFrame(
+        {
+            "texto": ["a", "b", "c"],
+            "campo1": ["x", None, None],
+            "campo2": ["x", None, None],
+            "_dataframeit_status": ["processed", None, None],
+        }
+    )
+    chamadas = MagicMock(side_effect=_llm())
+
+    _roda(df, chamadas, track_tokens=False)
+
+    [barra] = barras
+    assert chamadas.call_count == 2
     assert (barra.total, barra.n) == (3, 3)
 
 

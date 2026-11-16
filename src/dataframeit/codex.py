@@ -31,11 +31,13 @@ from .errors import (
     ProviderOverloadedError,
     ProviderTransientError,
     ProviderUsageLimitError,
+    _http_error_status_or_none,
     _is_recoverable_http_status,
+    dump_response,
     retry_with_backoff,
     validation_error_summary,
 )
-from .llm import LLMConfig, Usage, build_prompt
+from .llm import LLMConfig, Usage, _set_failed_usage, build_prompt
 from .utils import _user_stacklevel
 
 if TYPE_CHECKING:
@@ -90,6 +92,13 @@ _CODEX_CONFIG_OVERRIDES = (
     # termina; desligada, o turno falha e a nova tentativa fica com o
     # `retry_with_backoff` da linha.
     "features.unbounded_connection_retries=false",
+    # Ligada, o request dos modelos com `use_responses_lite` leva as instruções
+    # base duas vezes quando não há ferramenta a oferecer: uma no estado do
+    # mundo e outra no prefixo do request.
+    "features.incremental_tools=false",
+    # Ligada, o `input` ganha um item `configuration_update` com o mesmo effort
+    # que o request já leva em `reasoning`.
+    "features.reasoning_effort_override=false",
 )
 # Campos do catálogo de modelos que põem ferramentas no request, com o valor que
 # as tira. O runtime lê esses campos do catálogo que baixa do servidor, e
@@ -414,7 +423,7 @@ def _build_schema(pydantic_model: type[BaseModel]) -> dict[str, Any]:
 def _validate_config(config: LLMConfig) -> ReasoningEffort:
     from openai_codex.types import ReasoningEffort  # noqa: PLC0415 (extra codex opcional)
 
-    if config.api_key:
+    if bool(config.api_key):
         msg = "provider='codex' usa a autenticação do Codex; não passe api_key"
         raise ProviderConfigurationError(msg)
 
@@ -467,7 +476,9 @@ def _isolated_runtime() -> Generator[tuple[Path, Path], None, None]:
     from filelock import FileLock, Timeout  # noqa: PLC0415 (extra codex opcional)
 
     configured_home = os.environ.get("CODEX_HOME")
-    source_home = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
+    source_home = (
+        Path(configured_home).expanduser() if bool(configured_home) else Path.home() / ".codex"
+    )
     source_auth = source_home / "auth.json"
     if not source_auth.is_file():
         msg = (
@@ -813,11 +824,17 @@ class CodexBackend:
         # O uso soma todas as tentativas, inclusive as que falharam, estouraram
         # o prazo ou tiveram a resposta recusada, porque todas são cobradas.
         usage_total: Usage = {}
+
+        def _on_failure(error: Exception) -> None:
+            error.row_usage = usage_total  # ty: ignore[unresolved-attribute]
+            _set_failed_usage(error, usage_total)
+
         return retry_with_backoff(
             lambda: self._invoke_once(prompt, usage_total),
             self.config.max_retries,
             self.config.base_delay,
             self.config.max_delay,
+            on_failure=_on_failure,
         )
 
     def _invoke_once(self, prompt: str, usage_total: Usage) -> dict[str, Any]:
@@ -882,7 +899,7 @@ class CodexBackend:
             msg = f"Resposta do Codex não corresponde ao schema: {validation_error_summary(err)}"
             raise ProviderOutputError(msg) from err
 
-        return {"data": validated.model_dump(by_alias=False), "usage": dict(usage_total) or None}
+        return {"data": dump_response(validated), "usage": dict(usage_total) or None}
 
 
 def _interrupt_quietly(turn: TurnHandle) -> None:
@@ -1130,7 +1147,7 @@ def _raise_turn_error(error: TurnError | None) -> NoReturn:
     for variant_type, payload_field in http_variants:
         if not isinstance(root, variant_type):
             continue
-        status = getattr(root, payload_field).http_status_code
+        status = _http_error_status_or_none(getattr(root, payload_field).http_status_code)
         if status == _HTTP_TOO_MANY_REQUESTS:
             error_class = ProviderOverloadedError
         elif status is None or _is_recoverable_http_status(status):

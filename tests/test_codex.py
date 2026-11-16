@@ -24,7 +24,7 @@ from uuid import UUID
 
 import pandas as pd
 import pytest
-from pydantic import UUID4, AnyUrl, BaseModel, ConfigDict, Field, RootModel
+from pydantic import UUID4, AnyUrl, BaseModel, ConfigDict, Field, RootModel, field_validator
 from pydantic.errors import PydanticInvalidForJsonSchema
 from typing_extensions import override
 
@@ -1389,6 +1389,55 @@ class TestCodexInvocation:
 
         assert client.thread_start.call_count == 1
 
+    def test_conjunto_de_submodelos_volta_como_lista(self, codex_sdk, tmp_path):
+        class Cidade(BaseModel):
+            model_config = ConfigDict(frozen=True)
+            nome: str
+
+        class ConjuntoDeModelo(BaseModel):
+            campo: set[Cidade]
+
+        backend, client, _, _ = initialized_backend(
+            tmp_path,
+            codex_sdk,
+            make_result(codex_sdk, response='{"campo": [{"nome": "SP"}, {"nome": "RJ"}]}'),
+        )
+        backend = dataclasses.replace(
+            backend,
+            config=dataclasses.replace(backend.config, max_retries=3),
+            _pydantic_model=ConjuntoDeModelo,
+        )
+
+        assert backend.invoke("texto")["data"] == {"campo": [{"nome": "RJ"}, {"nome": "SP"}]}
+        assert client.thread_start.call_count == 1
+
+    def test_chave_de_dict_que_e_submodelo_interrompe_sem_nova_tentativa(self, codex_sdk, tmp_path):
+        class Cidade(BaseModel):
+            model_config = ConfigDict(frozen=True)
+            nome: str
+
+        class ChaveDeModelo(BaseModel):
+            campo: dict[Cidade, int]
+
+            @field_validator("campo", mode="before")
+            @classmethod
+            def _chave_em_modelo(cls, valor):
+                return {Cidade(nome=nome): numero for nome, numero in valor.items()}
+
+        backend, client, _, _ = initialized_backend(
+            tmp_path, codex_sdk, make_result(codex_sdk, response='{"campo": {"SP": 1}}')
+        )
+        backend = dataclasses.replace(
+            backend,
+            config=dataclasses.replace(backend.config, max_retries=3),
+            _pydantic_model=ChaveDeModelo,
+        )
+
+        with pytest.raises(ProviderAbortError, match="unhashable type: 'dict'"):
+            backend.invoke("texto")
+
+        assert client.thread_start.call_count == 1
+
     def test_number_in_rejected_response_is_not_a_credential_error(self, codex_sdk, tmp_path):
         response = '{"sentimento": "Súmula 403 do STJ", "confianca": "art. 401"}'
         backend, _, _, _ = initialized_backend(
@@ -2105,6 +2154,24 @@ class TestClassificacaoDoTurnoQueFalhou:
             "reasoning_tokens": 30,
             "total_tokens": 390,
         }
+
+    def test_uso_das_tentativas_sem_sucesso_vai_na_excecao(self, codex_sdk, tmp_path):
+        _, _, generated = codex_sdk
+        backend, _, _, turn = initialized_backend(tmp_path, codex_sdk)
+        overloaded = generated.CodexErrorInfo(root=generated.CodexErrorInfoValue.server_overloaded)
+        turn.stream.side_effect = [
+            as_stream(make_result(codex_sdk, response=None, error_info=overloaded)),
+            as_stream(make_result(codex_sdk, response=None, error_info=overloaded)),
+        ]
+
+        with (
+            pytest.warns(UserWarning, match="Tentativa 1/2"),
+            pytest.raises(ProviderTransientError) as erro,
+        ):
+            backend.invoke("texto")
+
+        assert erro.value.row_usage["input_tokens"] == 200  # ty: ignore[unresolved-attribute]
+        assert erro.value.row_usage["total_tokens"] == 260  # ty: ignore[unresolved-attribute]
 
     def test_turno_sem_uso_informado_nao_inventa_tokens(self, codex_sdk, tmp_path):
         _, _, generated = codex_sdk

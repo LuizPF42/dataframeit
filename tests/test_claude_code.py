@@ -15,12 +15,13 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from dataframeit import dataframeit
 from dataframeit.claude_code import _build_json_system_prompt, call_claude_code
 from dataframeit.core import _empty_token_stats, _format_token_stats
 from dataframeit.errors import (
+    ProviderAbortError,
     ProviderError,
     ProviderOverloadedError,
     ProviderRejectedOutputError,
@@ -566,7 +567,12 @@ def test_custo_soma_as_tentativas_re_tentadas(sdk_falso):
     sdk_falso["por_chamada"] = [
         [
             _AssistantMessageFalso([_TextBlockFalso("não é json")]),
-            _resultado(is_error=False, subtype="success", total_cost_usd=0.1),
+            _resultado(
+                is_error=False,
+                subtype="success",
+                total_cost_usd=0.1,
+                usage={"input_tokens": 3, "output_tokens": 2},
+            ),
         ],
         _resposta_valida(0.2),
     ]
@@ -574,11 +580,18 @@ def test_custo_soma_as_tentativas_re_tentadas(sdk_falso):
     with pytest.warns(UserWarning, match="Tentativa 1/2 falhou"):
         resultado = _chamar(replace(_config_claude_code(), max_retries=2))
     assert resultado["usage"]["cost_usd"] == pytest.approx(0.3)
+    assert resultado["usage"]["input_tokens"] == 13
+    assert resultado["usage"]["total_tokens"] == 20
 
 
 def test_linha_que_falha_leva_o_custo_na_excecao(sdk_falso):
     sdk_falso["mensagens_do_sdk"] = [
-        _resultado(is_error=True, subtype="error_max_budget_usd", total_cost_usd=0.5),
+        _resultado(
+            is_error=True,
+            subtype="error_max_budget_usd",
+            total_cost_usd=0.5,
+            usage={"input_tokens": 4, "output_tokens": 1},
+        ),
     ]
     with (
         pytest.warns(UserWarning, match="Erro não-recuperável detectado"),
@@ -587,6 +600,7 @@ def test_linha_que_falha_leva_o_custo_na_excecao(sdk_falso):
         _chamar()
     # cost_usd é anexado à exceção pelo provider, fora da classe.
     assert erro.value.cost_usd == pytest.approx(0.5)  # ty: ignore[unresolved-attribute]
+    assert erro.value.row_usage["total_tokens"] == 5  # ty: ignore[unresolved-attribute]
 
 
 @pytest.mark.parametrize("parallel_requests", [1, 2])
@@ -1015,3 +1029,55 @@ def test_resposta_devolve_o_campo_pelo_nome_com_serialize_by_alias(sdk_falso):
     )
 
     assert resultado["data"] == {"sentimento": "neutro"}
+
+
+class _Cidade(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    nome: str
+
+
+class _ConjuntoDeModelo(BaseModel):
+    campo: set[_Cidade]
+
+
+def test_conjunto_de_submodelos_volta_como_lista(sdk_falso):
+    sdk_falso["mensagens_do_sdk"] = [
+        _AssistantMessageFalso([_TextBlockFalso('{"campo": [{"nome": "SP"}, {"nome": "RJ"}]}')]),
+        _ResultMessageFalso(usage=None),
+    ]
+
+    resultado = call_claude_code(
+        "texto da linha",
+        _ConjuntoDeModelo,
+        "Analise: {texto}",
+        replace(_config_claude_code(), max_retries=3),
+    )
+
+    assert resultado["data"] == {"campo": [{"nome": "RJ"}, {"nome": "SP"}]}
+    assert len(sdk_falso["opcoes"]) == 1
+
+
+class _ChaveDeModelo(BaseModel):
+    campo: dict[_Cidade, int]
+
+    @field_validator("campo", mode="before")
+    @classmethod
+    def _chave_em_modelo(cls, valor):
+        return {_Cidade(nome=nome): numero for nome, numero in valor.items()}
+
+
+def test_chave_de_dict_que_e_submodelo_interrompe_sem_nova_tentativa(sdk_falso):
+    sdk_falso["mensagens_do_sdk"] = [
+        _AssistantMessageFalso([_TextBlockFalso('{"campo": {"SP": 1}}')]),
+        _ResultMessageFalso(usage=None),
+    ]
+
+    with pytest.raises(ProviderAbortError, match="unhashable type: 'dict'"):
+        call_claude_code(
+            "texto da linha",
+            _ChaveDeModelo,
+            "Analise: {texto}",
+            replace(_config_claude_code(), max_retries=3),
+        )
+
+    assert len(sdk_falso["opcoes"]) == 1

@@ -85,7 +85,7 @@ codex = [
     "filelock>=3.13",
     # O SDK fixa a versão exata do runtime, e o runtime decide quais modelos a
     # conta do ChatGPT alcança: um runtime anterior ao modelo recebe HTTP 400.
-    "openai-codex==0.163.0",
+    "openai-codex==0.167.0",
 ]
 polars = [
     # Do 1.6 ao 1.9, a coluna só com dicts vazios sai do from_pandas sem linhas,
@@ -128,7 +128,7 @@ dev = [
     "pytest-cov>=4.0",
     "pytest-repeat>=0.9.4",
     "ruff>=0.16,<0.18",
-    "ty==0.0.98",
+    "ty==0.0.99",
     "vulture>=2.16,<3",
     "deptry>=0.25,<0.26",
     "pre-commit>=4.6,<5",
@@ -240,10 +240,16 @@ missing-override-decorator = "error"
 # Nome usado depois de um bloco que pode não tê-lo definido (`try`/`except`,
 # `with` que suprime exceção): o NameError só apareceria no caminho raro.
 possibly-unresolved-reference = "error"
+# Obriga a distinguir None de valores vazios, zero ou False; bool(x) marca os
+# pontos em que a equivalência é parte do contrato.
+truthiness-test-of-none-union = "error"
 
 [tool.vulture]
 paths = ["src"]
 min_confidence = 80
+# Argumentos que só os overloads de read_df declaram, para ligar o valor ao tipo
+# devolvido: a implementação os recebe em **kwargs e os repassa ao pandas.
+ignore_names = ["chunksize", "iterator", "sheet_name", "typ"]
 
 [tool.deptry]
 known_first_party = ["dataframeit"]
@@ -304,13 +310,22 @@ fail_under = 100
 show_missing = true
 skip_covered = true
 
-# Teste de mutação, rodado pelo workflow mutation.yml. Os módulos entram um a um
-# em only_mutate: o mutmut envolve cada função mutada num trampolim, e os
-# `stacklevel` fixos de core.py apontariam o aviso para o trampolim. Os testes
-# leem os exemplos, a documentação, os READMEs e os workflows, que vão junto
-# para a cópia em mutants/.
+# Teste de mutação, rodado pelo workflow mutation.yml. O mutmut envolve cada
+# função mutada num trampolim, por isso os avisos dos módulos mutados usam
+# _user_stacklevel() no lugar de um `stacklevel` fixo. Os testes leem os
+# exemplos, a documentação, os READMEs e os workflows, que vão junto para a
+# cópia em mutants/.
 [tool.mutmut]
 source_paths = ["src/dataframeit"]
-only_mutate = ["src/dataframeit/errors.py", "src/dataframeit/utils.py"]
+only_mutate = [
+    "src/dataframeit/conditional.py",
+    "src/dataframeit/core.py",
+    "src/dataframeit/errors.py",
+    "src/dataframeit/utils.py",
+]
 process_isolation = "forkserver"
+# O ty acusa antes dos testes o mutante que quebra um tipo, como o None no lugar
+# do False num argumento bool, e o mutmut o conta como detectado. O ty não acha
+# o mutmut que o `uv run --with` instala, e o import do trampolim fica sem tipo.
+type_check_command = ["ty", "check", "--output-format", "gitlab", "--ignore", "unresolved-import"]
 also_copy = ["example/", "docs/", "README.md", "README.pt-BR.md", "README.es.md", ".github/"]

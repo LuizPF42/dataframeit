@@ -22,17 +22,19 @@ import warnings
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import partial
 from pathlib import Path
-from types import CodeType, MethodType
+from types import CodeType, MethodType, UnionType
 from typing import (
     TYPE_CHECKING,
     Any,
     Literal,
     NotRequired,
+    Self,
     TypedDict,
+    Union,
     cast,
     get_args,
     get_origin,
@@ -41,7 +43,7 @@ from typing import (
 
 import numpy as np
 import pandas as pd
-from pandas.api.extensions import ExtensionArray
+from pandas.api.extensions import ExtensionArray, ExtensionDtype
 from pandas.api.types import infer_dtype, is_bool, is_scalar
 
 # O mesmo `pandas.util.hash_pandas_object`, que o `pandas.util` entrega por um
@@ -64,6 +66,7 @@ from .conditional import (
 from .errors import (
     ProviderAbortError,
     ProviderUsageLimitError,
+    dump_response,
     get_friendly_error_message,
     is_rate_limit_error,
     is_recoverable_error,
@@ -76,6 +79,7 @@ from .llm import (
     SearchConfig,
     SearchGroupConfig,
     _BuildOnce,
+    _take_failed_usage,
     acall_langchain,
     build_structured_llm,
     call_langchain,
@@ -83,19 +87,29 @@ from .llm import (
 )
 from .search import get_available_providers, get_provider
 from .utils import (
+    _ENTRY_POINTS,
+    _FLOAT_NAN_TEXT,
     _USER_COLUMN,
     DEFAULT_TEXT_COLUMN,
     ORIGINAL_TYPE_PANDAS_DF,
     ORIGINAL_TYPE_POLARS_DF,
     TOKEN_COLUMNS,
     ConversionInfo,
+    _accepts_only_decimal,
+    _admits_any,
     _admits_none,
+    _any_from_text,
     _column_rank,
     _dropped_by_model_serializer,
     _excluded_fields,
     _is_structure_class,
     _json_default,
     _keeps_nan,
+    _mixes_text_and_number,
+    _quoted_nan_text,
+    _quoted_scalar_text,
+    _reads_as_other,
+    _resolved,
     _silent_slice_write,
     _skipping_model,
     _user_stacklevel,
@@ -167,7 +181,7 @@ class _FallbackHandler(logging.Handler):
 # pulado de conditional.py. O handler de reserva mantém o resumo visível sem
 # configuração, e o nível WARNING nesse logger o silencia.
 def _is_fallback(handler: logging.Handler) -> bool:
-    return getattr(handler, "is_dataframeit_fallback", False)
+    return hasattr(handler, "is_dataframeit_fallback")
 
 
 def _install_fallback_handler(logger: logging.Logger) -> None:
@@ -298,6 +312,46 @@ class RowResult:
     elapsed_seconds: float
 
 
+_row_warning_site = threading.local()
+
+
+def _user_warning_site() -> tuple[str, int, str, dict[str, Any]] | None:
+    """Local, módulo e registro de avisos da chamada pública, para as threads."""
+    frame = inspect.currentframe()
+    while frame is not None:
+        if (
+            frame.f_code.co_name in {*_ENTRY_POINTS, "x_dataframeit__mutmut_orig"}
+            and frame.f_globals.get("__name__") == __name__
+        ):
+            # Uma chamada Python da função pública sempre tem frame chamador.
+            caller = cast("Any", frame.f_back)
+            if frame.f_code.co_name == "x_dataframeit__mutmut_orig":
+                while caller.f_code.co_name in {"trampoline", "_trampoline_wrapper"}:
+                    caller = caller.f_back
+            return (
+                caller.f_code.co_filename,
+                caller.f_lineno,
+                cast("str", caller.f_globals.get("__name__", "__main__")),
+                cast("dict[str, Any]", caller.f_globals.setdefault("__warningregistry__", {})),
+            )
+        frame = frame.f_back
+    return None
+
+
+def _warn_at_user(message: str) -> None:
+    """Emite aviso na chamada pública, também quando a linha roda em outra thread."""
+    if _user_warning_site() is not None:
+        warnings.warn(message, stacklevel=_user_stacklevel())
+        return
+    site = getattr(_row_warning_site, "value", None)
+    if site is not None:
+        warnings.warn_explicit(
+            message, UserWarning, site[0], site[1], module=site[2], registry=site[3]
+        )
+    else:
+        warnings.warn(message, stacklevel=2)
+
+
 def _recorded_error(df: pd.DataFrame, idx: Hashable) -> str | None:
     """Texto gravado em `_error_details` da linha, ou None com a célula vazia."""
     value = _get_cell(df, idx, "_error_details")
@@ -316,7 +370,7 @@ def _notify_row_done(on_row_done: Callable[[RowResult], None] | None, result: Ro
 
 def _warn_row_done_failed(result: RowResult, error: Exception) -> None:
     """Avisa da falha de on_row_done, que não para a execução."""
-    warnings.warn(f"on_row_done falhou na linha {result.index}: {_error_text(error)}", stacklevel=1)
+    _warn_at_user(f"on_row_done falhou na linha {result.index}: {_error_text(error)}")
 
 
 # Detalhe gravado na linha cujo texto está vazio, e que por isso não vai ao LLM.
@@ -341,7 +395,7 @@ def _missing_text_detail(
     *, row_already_processed: bool, reprocess_columns: Sequence[str] | None
 ) -> str:
     """Detalhe da linha sem texto; sob reprocess_columns, a linha mantém os valores."""
-    if row_already_processed and reprocess_columns:
+    if row_already_processed and bool(reprocess_columns):
         return _MISSING_TEXT_DETAIL + _KEPT_VALUES_NOTE
     return _MISSING_TEXT_DETAIL
 
@@ -363,7 +417,9 @@ def _as_object_columns(
     como NaN, que dali em diante é valor: a saída polars, que guarda o NaN
     dessas colunas, mostraria NaN na linha pendente e na de erro.
     """
-    with _silent_slice_write(df):
+    # No pandas 3, o contexto não lê o DataFrame, e trocá-lo por None, como faz o
+    # teste de mutação, não muda nada; no pandas 2, a troca levanta.
+    with _silent_slice_write(df):  # pragma: no mutate
         for col in columns:
             if col in df.columns and df[col].dtype != object:
                 values = df[col].astype(object)
@@ -386,7 +442,6 @@ def _warn_missing_texts(df: pd.DataFrame, text_column: str, rows: list[Hashable]
         warnings.warn(
             f"{missing} linha(s) sem texto não vão ao LLM e ficam com status 'error' "
             f"('{_MISSING_TEXT_DETAIL}').",
-            UserWarning,
             stacklevel=_user_stacklevel(),
         )
 
@@ -407,17 +462,47 @@ def _invoke_row(  # noqa: PLR0913 (a linha e o que a validação da retomada sab
     Com um backend campo a campo, os demais campos nem são pedidos: voltam com
     o valor já gravado, que também alimenta as condições. A célula ausente
     vai como None, pela mesma regra da validação da retomada (`_is_absent`),
-    e o NaN de `nan_columns` vai como NaN. A validação já trocou por None o
+    e o NaN de `nan_columns` vai como NaN, inclusive o do campo `Any` que ela
+    contou como valor (`_any_nan_columns`). A validação já trocou por None o
     NaN que a coluna não distingue do nulo, e o que resta nela é valor.
+
+    O campo `Iterable` ou `Generator` volta do model_dump como iterador, e a
+    célula o guardaria no lugar dos itens. A falha vem do modelo e se repete
+    a cada resposta com esse campo preenchido, e por isso interrompe a
+    execução, com o uso da resposta já paga na exceção.
     """
-    if reprocess_on_row and backend.invoke_partial:
+    if bool(reprocess_on_row) and backend.invoke_partial is not None:
         known = {
             col: None if _is_absent(row[col], nan_is_value=col in nan_columns) else row[col]
             for col in expected_columns
             if col not in reprocess_on_row and col in row.index
         }
-        return backend.invoke_partial(text, set(reprocess_on_row), known)
-    return backend.invoke(text)
+        result = backend.invoke_partial(text, set(reprocess_on_row), known)
+    else:
+        result = backend.invoke(text)
+    data = result["data"]
+    lazy = [col for col in expected_columns if col in data and _holds_iterator(data[col])]
+    if lazy:
+        msg = (
+            f"A resposta trouxe um iterador no lugar dos itens em {lazy}. O pydantic valida "
+            "e serializa a anotação Iterable ou Generator como iterador, e a célula guardaria "
+            "o iterador. Repetir a linha não resolve: declare list[...] nesse campo, ou no "
+            "campo de dentro dele que tem a anotação"
+        )
+        error = ProviderAbortError(msg)
+        error.row_usage = result.get("usage")  # ty: ignore[unresolved-attribute]
+        raise error
+    return result
+
+
+def _holds_iterator(value: object) -> bool:
+    """Se o valor é um iterador ou o guarda numa coleção de `_is_structure_class`."""
+    if isinstance(value, collections.abc.Iterator):
+        return True
+    if not _is_structure_class(type(value)):
+        return False
+    items = value.values() if isinstance(value, collections.abc.Mapping) else value
+    return any(_holds_iterator(item) for item in items)  # ty: ignore[not-iterable]
 
 
 def _is_absent(value: object, *, nan_is_value: bool) -> bool:
@@ -425,10 +510,12 @@ def _is_absent(value: object, *, nan_is_value: bool) -> bool:
 
     O pandas conta o Decimal NaN como ausente, mas ele é um valor que o campo
     Decimal com allow_inf_nan aceita, e a linha que o recebeu já foi paga; sem
-    a exceção, a retomada o acusaria como incompatível. O float NaN é valor
-    quando `nan_is_value`, na coluna que o distingue do nulo (`_keeps_nan`).
+    a exceção, a retomada o acusaria como incompatível. O Decimal sai antes do
+    pd.isna, que levanta InvalidOperation com o NaN sinalizador (sNaN). O float
+    NaN é valor quando `nan_is_value`, na coluna que o distingue do nulo
+    (`_keeps_nan`).
     """
-    if not (is_scalar(value) and bool(pd.isna(value))) or isinstance(value, Decimal):
+    if isinstance(value, Decimal) or not (is_scalar(value) and bool(pd.isna(value))):
         return False
     return not (nan_is_value and isinstance(value, float))
 
@@ -456,12 +543,11 @@ def _executed_form(pydantic_model: type[BaseModel]) -> Callable[[str, object], o
         if field_name not in field_models:
             field_models[field_name] = _field_model(pydantic_model, field_name)
         try:
-            validated = (
-                field_models[field_name]
-                .model_validate({field_name: value}, strict=False, by_alias=False, by_name=True)
-                .model_dump(by_alias=False)
-                .get(field_name)
-            )
+            validated = dump_response(
+                field_models[field_name].model_validate(
+                    {field_name: value}, strict=False, by_alias=False, by_name=True
+                )
+            ).get(field_name)
         except ValidationError:
             return value
         return _validated_where_same(validated, value)
@@ -481,15 +567,18 @@ def _condition_holds(condition: object, row_values: dict[str, Any], field_name: 
         return True
 
 
-def _validate_processed_rows(  # noqa: C901, PLR0912, PLR0915 (validação por linha e por campo)
+def _validate_processed_rows(  # noqa: C901, PLR0912, PLR0913, PLR0915 (validação por linha e por campo)
     df: pd.DataFrame,
     status_col: str,
     pydantic_model: type[BaseModel],
     complex_fields: set[str],
     *,
     empty_text_fields: Collection[str] = frozenset(),
+    any_nan_columns: Collection[str] = frozenset(),
 ) -> tuple[list[str], dict[tuple[int, str], Any]]:
     """Valida linhas concluídas sem alterar o checkpoint recebido.
+
+    Em `any_nan_columns`, os campos `Any` cujo NaN é valor (`_any_nan_columns`).
 
     Em `empty_text_fields`, os campos cuja célula ausente é o texto vazio que o
     CSV ou o XLSX do checkpoint gravou (ver `_resume_from_checkpoint`), salvo
@@ -509,7 +598,7 @@ def _validate_processed_rows(  # noqa: C901, PLR0912, PLR0915 (validação por l
         """Campos acusados pelo erro; o erro do modelo inteiro acusa todos."""
         rejected = set()
         for detail in error.errors():
-            location = detail.get("loc", ())
+            location = detail["loc"]
             # A linha se valida pelo nome (_validate_row), que o erro traz.
             if location and location[0] in pydantic_model.model_fields:
                 rejected.add(str(location[0]))
@@ -582,13 +671,17 @@ def _validate_processed_rows(  # noqa: C901, PLR0912, PLR0915 (validação por l
     # O NaN só é valor na coluna de objetos, que guarda o None à parte. Na
     # coluna float64, como a do CSV relido, o NaN é também a resposta None e a
     # linha pendente, e segue contando como ausente.
-    nan_columns = {
+    nan_columns = frozenset(any_nan_columns) | {
         field_name
         for field_name, field in pydantic_model.model_fields.items()
         if field_name in df.columns
         and df[field_name].dtype == object
         and _keeps_nan(field.annotation)
     }
+    # A coluna de objetos de um campo `Any` sem nenhum None: o NaN de uma linha
+    # processada conta como ausente e volta None, e o aviso diz em quais.
+    ambiguous_any = _any_object_columns(df, pydantic_model) - nan_columns
+    dropped_nan: set[str] = set()
     # O isin lê o pd.NA, status ausente da coluna `string` de convert_dtypes.
     processed_positions = np.flatnonzero(df[status_col].isin(["processed"])).tolist()
     for position in processed_positions:
@@ -601,6 +694,8 @@ def _validate_processed_rows(  # noqa: C901, PLR0912, PLR0915 (validação por l
             value = row[field_name]
             if _is_absent(value, nan_is_value=field_name in nan_columns):
                 row_values[field_name] = None
+                if field_name in ambiguous_any and isinstance(value, float):
+                    dropped_nan.add(field_name)
             elif field_name in complex_fields:
                 row_values[field_name] = normalize_value(value)
             elif isinstance(value, pd.Timestamp):
@@ -611,10 +706,7 @@ def _validate_processed_rows(  # noqa: C901, PLR0912, PLR0915 (validação por l
                 row_values[field_name] = value
 
         empty_cells = {
-            field_name
-            for field_name in empty_text_fields
-            if row_values[field_name] is None
-            and (field_name not in df.columns or pd.isna(row[field_name]))
+            field_name for field_name in empty_text_fields if row_values[field_name] is None
         }
         skipped_fields = set()
         if any(row_values[field_name] is None for field_name in conditions):
@@ -633,14 +725,15 @@ def _validate_processed_rows(  # noqa: C901, PLR0912, PLR0915 (validação por l
         skipped = frozenset(skipped_fields)
 
         projected = {}
-        missing_values = set()
+        # Na ordem do modelo, que o preenchimento dos defaults da linha recusada segue.
+        missing_values = []
         restored = set()
         omitted_required = set()
         for field_name, field in pydantic_model.model_fields.items():
             if field_name in excluded_fields:
                 continue
             value = row_values[field_name]
-            if value is None and (field_name not in df.columns or pd.isna(row[field_name])):
+            if value is None:
                 if field_name in omittable_fields and field_name in df.columns:
                     if field.is_required():
                         omitted_required.add(field_name)
@@ -654,7 +747,7 @@ def _validate_processed_rows(  # noqa: C901, PLR0912, PLR0915 (validação por l
                     values_to_fill[(position, field_name)] = ""
                     restored.add(field_name)
                     continue
-                missing_values.add(field_name)
+                missing_values.append(field_name)
                 if field_name in skipped or not (
                     field.is_required() or field_name in written_none_fields
                 ):
@@ -691,7 +784,7 @@ def _validate_processed_rows(  # noqa: C901, PLR0912, PLR0915 (validação por l
             field_name for field_name in restored if validated_data[field_name] != ""
         )
 
-        for field_name in missing_values & validated_data.keys():
+        for field_name in validated_data.keys() & missing_values:
             values_to_fill[(position, field_name)] = validated_data[field_name]
 
         # O arquivo não guarda o tipo de todo valor (ver _validate_row). O
@@ -721,8 +814,46 @@ def _validate_processed_rows(  # noqa: C901, PLR0912, PLR0915 (validação por l
             elif (converted := _validated_where_same(validated, value)) is not value:
                 values_to_fill[(position, field_name)] = converted
 
+    if dropped_nan:
+        warnings.warn(
+            f"As colunas {[field for field in expected_columns if field in dropped_nan]}, de "
+            "campo `Any`, têm NaN em linhas já processadas e nenhum None: o NaN conta como a "
+            "célula vazia de um arquivo relido e volta None. Ele só é mantido como valor "
+            "quando a coluna guarda algum None, como o da linha pendente de uma execução "
+            "interrompida.",
+            UserWarning,
+            stacklevel=_user_stacklevel(),
+        )
     ordered_incompatible = [field for field in expected_columns if field in incompatible_fields]
     return ordered_incompatible, values_to_fill
+
+
+def _any_object_columns(df: pd.DataFrame, pydantic_model: type[BaseModel]) -> frozenset[str]:
+    """Os campos `Any` do modelo com coluna de objetos na entrada."""
+    return frozenset(
+        field_name
+        for field_name, field in pydantic_model.model_fields.items()
+        if field_name in df.columns
+        and df[field_name].dtype == object
+        and _admits_any(field.annotation)
+    )
+
+
+def _any_nan_columns(df: pd.DataFrame, pydantic_model: type[BaseModel]) -> frozenset[str]:
+    """Os campos `Any` cujo NaN é valor: os de coluna de objetos com algum None.
+
+    O campo `Any` recebe o NaN que o modelo devolveu, mas a coluna de objetos
+    dele chega também de um arquivo relido sem o modelo, com NaN em toda
+    célula vazia. Nele o NaN só é valor quando a coluna guarda algum None,
+    como o da linha pendente da saída interrompida, que o leitor de arquivo
+    não produz. A validação da retomada e o laço das linhas leem o mesmo
+    conjunto, tirado da entrada antes de a validação gravar None nela.
+    """
+    return frozenset(
+        field_name
+        for field_name in _any_object_columns(df, pydantic_model)
+        if any(value is None for value in df[field_name])
+    )
 
 
 def _validate_row(
@@ -738,36 +869,77 @@ def _validate_row(
     datetime à meia-noite. O modelo com strict=True recusa essas formas.
     Quando a validação configurada recusa a linha, ela é refeita sem strict,
     e cada campo recusado só é aceito se o valor validado diz o mesmo que o
-    relido (_same_value): o "3" num campo int strict continua recusado,
-    porque o conteúdo do checkpoint não é o que o modelo aceita.
+    relido no caminho de cada erro (_same_at): o "3" num campo int strict
+    continua recusado, porque o conteúdo do checkpoint não é o que o modelo
+    aceita. O resto do campo não é comparado: o validador de um submodelo que
+    muda o valor a cada passada não recusa a linha pela data ao lado.
 
     A execução grava a resposta pelo nome dos campos, também dentro do
     submodelo, e a linha se valida só pelo nome: o alias igual ao nome de
     outro campo não lê o valor dele.
     """
     try:
-        return model.model_validate(projected, by_alias=False, by_name=True).model_dump(
-            by_alias=False
-        ), set()
+        return dump_response(model.model_validate(projected, by_alias=False, by_name=True)), set()
     except ValidationError as error:
         rejected = rejected_fields(error)
+        locations = [detail["loc"] for detail in error.errors()]
     try:
-        validated_data = model.model_validate(
-            projected, strict=False, by_alias=False, by_name=True
-        ).model_dump(by_alias=False)
+        validated_data = dump_response(
+            model.model_validate(projected, strict=False, by_alias=False, by_name=True)
+        )
     except ValidationError as error:
         return None, rejected_fields(error)
     # O campo que o dump não traz, como o de exclude_if, fica sem o valor para
-    # comparar e continua recusado.
+    # comparar e continua recusado. O campo acusado pelo erro do modelo inteiro,
+    # sem caminho próprio, se compara inteiro.
     changed = {
         field_name
         for field_name in rejected & projected.keys()
         if field_name not in validated_data
-        or not _same_value(validated_data[field_name], projected[field_name])
+        or not all(
+            _same_at(validated_data[field_name], projected[field_name], path)
+            for path in _error_paths(locations, field_name)
+        )
     }
     if changed:
         return None, changed
     return validated_data, set()
+
+
+def _error_paths(
+    locations: list[tuple[int | str, ...]], field_name: str
+) -> list[tuple[int | str, ...]]:
+    """O caminho dentro do campo de cada erro dele; sem erro próprio, o campo inteiro."""
+    return [loc[1:] for loc in locations if loc[:1] == (field_name,)] or [()]
+
+
+def _same_at(validated: object, value: object, path: tuple[int | str, ...]) -> bool:
+    """Se o valor validado diz o mesmo que o relido no caminho de um erro de validação.
+
+    Desce pelo caminho enquanto os dois lados têm o passo: a chave do dict, ou
+    o índice da lista ou da tupla. O passo que um lado não tem, como o nome do
+    membro que o erro de uma união traz, encerra a descida, e o valor inteiro
+    daquele nível é comparado. O campo se compara por `_same_value`, e o que
+    está abaixo dele, que o checkpoint grava em JSON, pelo texto JSON
+    (`_same_json`), como em `_validated_where_same`.
+    """
+    same = _same_value
+    for step in path:
+        if isinstance(validated, dict) and isinstance(value, dict):
+            if step not in validated or step not in value:
+                break
+            validated, value = validated[step], value[step]
+        elif (
+            isinstance(validated, (list, tuple))
+            and isinstance(value, (list, tuple))
+            and isinstance(step, int)
+            and step < min(len(validated), len(value))
+        ):
+            validated, value = validated[step], value[step]
+        else:
+            break
+        same = _same_json
+    return same(validated, value)
 
 
 # A partir dele, o float não distingue dois inteiros vizinhos.
@@ -809,9 +981,25 @@ def _same_value(validated: object, value: object) -> bool:  # noqa: PLR0911 (uma
         return False
     if type(validated) is dt.date and isinstance(value, dt.datetime):
         return value == dt.datetime.combine(validated, dt.time())
-    if isinstance(validated, Decimal) and isinstance(value, float):
-        return float(validated) == value
+    if isinstance(validated, Decimal):
+        return _same_decimal(validated, value)
     return bool(validated == value)
+
+
+def _same_decimal(validated: Decimal, value: object) -> bool:
+    """Se o Decimal validado diz o mesmo que o escalar relido, que não deu o mesmo JSON.
+
+    O NaN só diz o mesmo pelo texto, que o JSON já comparou; a igualdade e o
+    float() do Decimal levantam com o NaN sinalizador, de um lado ou do outro.
+    """
+    if validated.is_nan():
+        return False
+    if isinstance(value, float):
+        return float(validated) == value
+    try:
+        return bool(validated == value)
+    except InvalidOperation:
+        return False
 
 
 def _same_json(left: object, right: object) -> bool:
@@ -848,23 +1036,21 @@ def _validated_where_same(
     if same(validated, value):
         return validated
     if isinstance(validated, dict) and isinstance(value, dict) and len(validated) == len(value):
-        if not all(
-            _same_json({key: None}, {read_key: None})
-            for key, read_key in zip(validated, value, strict=True)
-        ):
+        if not _same_json(dict.fromkeys(validated), dict.fromkeys(value)):
             return value
-        return {
-            key: _validated_where_same(item, read, _same_json)
-            for (key, item), read in zip(validated.items(), value.values(), strict=True)
-        }
+        # Os dois dicts têm o mesmo tamanho, e o strict do zip nunca levanta; o
+        # teste de mutação o troca por None ou pelo default, que dão o mesmo.
+        pairs = zip(validated.items(), value.values(), strict=True)  # pragma: no mutate
+        return {key: _validated_where_same(item, read, _same_json) for (key, item), read in pairs}
     if (
         isinstance(validated, (list, tuple))
         and isinstance(value, (list, tuple))
         and len(validated) == len(value)
     ):
+        # As duas sequências têm o mesmo tamanho; ver o zip do dict acima.
         items = [
             _validated_where_same(item, read, _same_json)
-            for item, read in zip(validated, value, strict=True)
+            for item, read in zip(validated, value, strict=True)  # pragma: no mutate
         ]
         return tuple(items) if isinstance(validated, tuple) else items
     return value
@@ -885,7 +1071,9 @@ def _apply_processed_values(
     by_column: dict[str, dict[int, Any]] = {}
     for (position, field_name), value in values.items():
         by_column.setdefault(field_name, {})[position] = value
-    with _silent_slice_write(df):
+    # No pandas 3, o contexto não lê o DataFrame, e trocá-lo por None, como faz o
+    # teste de mutação, não muda nada; no pandas 2, a troca levanta.
+    with _silent_slice_write(df):  # pragma: no mutate
         for field_name, cells in by_column.items():
             column = df[field_name].to_numpy(dtype=object, copy=True)
             for position, value in cells.items():
@@ -1046,7 +1234,7 @@ def _warn_search_rate_limit(  # noqa: PLR0913 (configuração de busca da execu�
         + "."
     )
 
-    warnings.warn(msg, UserWarning, stacklevel=_user_stacklevel())
+    warnings.warn(msg, stacklevel=_user_stacklevel())
 
 
 def _validate_search_overrides(
@@ -1072,12 +1260,18 @@ def _validate_search_overrides(
 
 
 def _validate_prompts(label: str, config: dict[str, Any], keys: tuple[str, ...]) -> None:
-    """Recusa o prompt de campo ou de grupo que não é texto nem None."""
+    """Recusa prompts inválidos ou duas substituições para o mesmo campo."""
     for key in keys:
         value = config.get(key)
         if value is not None and not isinstance(value, str):
             msg = f"{label}: {key} deve ser texto, não {type(value).__name__}"
             raise ValueError(msg)
+        if isinstance(value, str) and value and not value.strip():
+            msg = f"{label}: {key} não pode conter só espaços"
+            raise ValueError(msg)
+    if "prompt_replace" in keys and config.get("prompt") and config.get("prompt_replace"):
+        msg = f"{label}: use apenas prompt ou prompt_replace, não os dois"
+        raise ValueError(msg)
 
 
 def _is_positive_int(value: object) -> bool:
@@ -1166,7 +1360,7 @@ def _validate_field_configs(
         return
 
     _, dependencies = get_field_execution_order(questions, _model_field_configs(questions))
-    if search_config.groups:
+    if bool(search_config.groups):
         get_group_execution_units(questions, search_config.groups, dependencies)
 
 
@@ -1308,7 +1502,13 @@ def _validate_status_column(
     # (track_tokens é o padrão) gravaria por cima do status.
     if (
         status_col != "_dataframeit_status"
-        and _column_rank(status_col, "_dataframeit_status") != _USER_COLUMN
+        and _column_rank(
+            status_col,
+            # O segundo argumento só decide o rank do próprio status padrão, que a
+            # linha de cima já excluiu: o teste de mutação o troca à toa.
+            "_dataframeit_status",  # pragma: no mutate
+        )
+        != _USER_COLUMN
     ):
         msg = (
             f"status_column='{status_col}' é o nome de uma coluna de controle do dataframeit, "
@@ -1437,7 +1637,7 @@ def dataframeit(  # noqa: PLR0913, PLR0917 (API pública: cada parâmetro é uma
     batch_size: int | None = None,
     checkpoint_path: str | os.PathLike[str] | None = None,
     on_row_done: Callable[[RowResult], None] | None = None,
-) -> pd.DataFrame | PolarsDataFrame:
+) -> pd.DataFrame | PolarsDataFrame:  # pragma: no mutate block
     """Processa textos usando LLMs para extrair informações estruturadas.
 
     Suporta múltiplos tipos de entrada:
@@ -1925,7 +2125,7 @@ def _prepare_run(  # noqa: C901, PLR0912, PLR0913, PLR0915 (a validação de cad
 
     # Validar e normalizar save_trace
     trace_mode = None
-    if save_trace:
+    if bool(save_trace):
         if not use_search:
             msg = "save_trace requer use_search=True"
             raise ValueError(msg)
@@ -2006,7 +2206,7 @@ def _prepare_run(  # noqa: C901, PLR0912, PLR0913, PLR0915 (a validação de cad
         raise ValueError(msg)
 
     # Validar e processar search_groups
-    if search_groups:
+    if bool(search_groups):
         validated_groups = _validate_search_groups(
             search_groups,
             questions,
@@ -2065,6 +2265,22 @@ def _prepare_run(  # noqa: C901, PLR0912, PLR0913, PLR0915 (a validação de cad
             checkpoint,
             meta={"signature": signature, "texts": _text_hashes(df_pandas[text_column])},
             structures=frozenset(complex_fields),
+            any_fields=frozenset(
+                field_name
+                for field_name, field in questions.model_fields.items()
+                if _admits_any(field.annotation)
+            ),
+            nan_fields=nan_columns,
+            decimal_fields=frozenset(
+                field_name
+                for field_name, field in questions.model_fields.items()
+                if _accepts_only_decimal(field.annotation)
+            ),
+            scalar_fields=frozenset(
+                field_name
+                for field_name, field in questions.model_fields.items()
+                if _mixes_text_and_number(field.annotation)
+            ),
         )
         if resume and status_col not in df_pandas.columns and checkpoint.path.exists():
             with _silent_slice_write(df_pandas):
@@ -2111,13 +2327,20 @@ def _prepare_run(  # noqa: C901, PLR0912, PLR0913, PLR0915 (a validação de cad
     existing_cols = [col for col in value_columns if col in df_pandas.columns]
     # Sem a coluna de status, toda linha é nova, como com resume=True, e o
     # valor que a execução sobrescreveria já foi recusado em _raise_if_overwritten.
-    if existing_cols and not resume and not reprocess_columns and input_has_status:
-        warnings.warn(
-            f"Colunas {existing_cols} já existem. Use resume=True para continuar ou renomeie-as.",
-            stacklevel=1,
+    if existing_cols and not resume and not bool(reprocess_columns) and input_has_status:
+        _warn_at_user(
+            f"Colunas {existing_cols} já existem. Use resume=True para continuar ou renomeie-as."
         )
         return from_pandas(df_pandas, conversion_info, status_col)
 
+    # O NaN de `Any` que a validação abaixo conta como valor segue valor no
+    # laço das linhas, para o reprocessamento campo a campo e para as marcas da
+    # interrupção. Tirado antes dela, que grava None nas células ausentes.
+    any_nan_columns = _any_nan_columns(df_pandas, questions)
+    if checkpoint is not None and status_col in df_pandas.columns and not input_has_status:
+        # A coluna que veio do checkpoint desta execução (`_resume_from_checkpoint`)
+        # guarda o NaN à parte da célula vazia, também sem nenhum None.
+        any_nan_columns |= checkpoint.any_fields.intersection(df_pandas.columns)
     # Com resume True ou False, a linha 'processed' não vai ao modelo; o campo
     # obrigatório que ela não tem é acusado aqui, em vez de sair vazio.
     incompatible_columns, processed_values = _validate_processed_rows(
@@ -2126,7 +2349,9 @@ def _prepare_run(  # noqa: C901, PLR0912, PLR0913, PLR0915 (a validação de cad
         questions,
         complex_fields,
         empty_text_fields=empty_text_fields,
+        any_nan_columns=any_nan_columns,
     )
+    row_nan_columns = nan_columns | any_nan_columns
     # O campo sem coluna nunca foi perguntado às linhas já processadas, que só
     # o recebem pelo reprocessamento; sem ele, ficam com o padrão ou None.
     has_processed_rows = (
@@ -2160,7 +2385,7 @@ def _prepare_run(  # noqa: C901, PLR0912, PLR0913, PLR0915 (a validação de cad
     # Um checkpoint sem posição pendente não depende do provider nem de autenticação.
     if (
         resume
-        and not reprocess_columns
+        and not bool(reprocess_columns)
         and status_col in df_pandas.columns
         and df_pandas[status_col].notna().all()
     ):
@@ -2250,6 +2475,7 @@ def _prepare_run(  # noqa: C901, PLR0912, PLR0913, PLR0915 (a validação de cad
         expected_columns=expected_columns,
         value_columns=value_columns,
         nan_columns=nan_columns,
+        row_nan_columns=frozenset(row_nan_columns),
         complex_fields=complex_fields,
         processed_values=processed_values,
         resume=resume,
@@ -2278,6 +2504,9 @@ class _Run:
     expected_columns: list[str]
     value_columns: list[str]
     nan_columns: frozenset[str]
+    # As de `nan_columns` e os campos `Any` cujo NaN é valor: as que os laços
+    # das linhas recebem como `nan_columns`.
+    row_nan_columns: frozenset[str]
     complex_fields: set[str]
     processed_values: dict[tuple[int, str], Any]
     resume: bool
@@ -2294,7 +2523,7 @@ class _Run:
             "text_column": self.text_column,
             "status_col": self.status_col,
             "expected_columns": self.expected_columns,
-            "nan_columns": self.nan_columns,
+            "nan_columns": self.row_nan_columns,
             "value_columns": self.value_columns,
             "config": self.config,
             "conversion_info": self.conversion_info,
@@ -2361,7 +2590,7 @@ def _finish_run(run: _Run, token_stats: TokenStats) -> pd.DataFrame | PolarsData
     df_pandas = run.df
     status_col = run.status_col
     conversion_info = run.conversion_info
-    if token_stats.get("abort"):
+    if bool(token_stats.get("abort")):
         pending = int(df_pandas[status_col].isna().sum())
         kept = int(df_pandas["_error_details"].eq(_INTERRUPTED_REPROCESS_DETAIL).sum())
         summary = f"{pending} linha(s) ficaram sem status"
@@ -2407,7 +2636,7 @@ def _finish_run(run: _Run, token_stats: TokenStats) -> pd.DataFrame | PolarsData
             _stats_logger.info("%s", summary_text)
 
     # Independe de track_tokens: o número final de workers é a dica de configuração.
-    if token_stats.get("workers_reduced"):
+    if bool(token_stats.get("workers_reduced")):
         warnings.warn(
             f"Workers reduzidos por rate limit: de {token_stats['initial_workers']} para "
             f"{token_stats['final_workers']}. Considere usar "
@@ -2420,7 +2649,7 @@ def _finish_run(run: _Run, token_stats: TokenStats) -> pd.DataFrame | PolarsData
     return from_pandas(df_pandas, conversion_info, status_col, run.annotations)
 
 
-def _setup_columns(  # noqa: C901, PLR0912, PLR0913 (uma família de colunas por recurso ligado)
+def _setup_columns(  # noqa: PLR0913 (uma família de colunas por recurso ligado)
     df: pd.DataFrame,
     expected_columns: list[str],
     status_column: str | None,
@@ -2438,9 +2667,9 @@ def _setup_columns(  # noqa: C901, PLR0912, PLR0913 (uma família de colunas por
 
     # Colunas de trace
     trace_cols = []
-    if trace_mode:
-        if search_config and search_config.per_field and pydantic_model:
-            if search_config.groups:
+    if bool(trace_mode):
+        if search_config is not None and search_config.per_field and pydantic_model is not None:
+            if bool(search_config.groups):
                 # Com grupos: trace por grupo + trace por campo isolado
                 grouped_fields = set()
                 for group_config in search_config.groups.values():
@@ -2462,38 +2691,13 @@ def _setup_columns(  # noqa: C901, PLR0912, PLR0913 (uma família de colunas por
             # Coluna única
             trace_cols = ["_trace"]
 
-    # Identificar colunas que precisam ser criadas
-    new_cols = [col for col in expected_columns if col not in df.columns]
-    needs_status = status_col not in df.columns
-    needs_error = error_col not in df.columns
-    needs_tokens = [col for col in token_cols if col not in df.columns] if track_tokens else []
-    needs_search = [col for col in search_cols if col not in df.columns]
-    needs_trace = [col for col in trace_cols if col not in df.columns]
-
-    if (
-        not new_cols
-        and not needs_status
-        and not needs_error
-        and not needs_tokens
-        and not needs_search
-        and not needs_trace
-    ):
-        return
-
-    with _silent_slice_write(df):
-        for col in new_cols:
-            df[col] = None
-        if needs_status:
-            df[status_col] = None
-        if needs_error:
-            df[error_col] = None
-        if track_tokens:
-            for col in needs_tokens:
+    columns = (*expected_columns, status_col, error_col, *token_cols, *search_cols, *trace_cols)
+    # No pandas 3, o contexto não lê o DataFrame, e trocá-lo por None, como faz o
+    # teste de mutação, não muda nada; no pandas 2, a troca levanta.
+    with _silent_slice_write(df):  # pragma: no mutate
+        for col in columns:
+            if col not in df.columns:
                 df[col] = None
-        for col in needs_search:
-            df[col] = None
-        for col in needs_trace:
-            df[col] = None
 
 
 def _get_processing_indices(
@@ -2581,7 +2785,7 @@ def _format_token_stats(
     if token_stats["search_count"] > 0:
         lines += [
             "-" * 60,
-            f"METRICAS DE BUSCA ({(search_provider or 'tavily').upper()})",
+            f"METRICAS DE BUSCA ({search_provider.upper() if bool(search_provider) else 'TAVILY'})",
             "-" * 60,
             f"Total de buscas: {token_stats['search_count']}",
             f"Creditos usados: {token_stats['search_credits']}",
@@ -2718,6 +2922,10 @@ def _outside_json(value: object, path: frozenset[int] = frozenset()) -> bool:
     # da classe do usuário.
     if callable(value) or isinstance(value, _TABLES):
         return True
+    # O Pydantic escreve a dataclass e o modelo pelos campos, com o conjunto de
+    # um campo na ordem de iteração.
+    if _is_record(value):
+        return _holds_unordered_set(value)
     if not _is_structure_class(type(value)):
         return False
     if isinstance(value, collections.abc.Set):
@@ -2729,9 +2937,12 @@ def _outside_json(value: object, path: frozenset[int] = frozenset()) -> bool:
     if id(value) in path:
         return True
     if isinstance(value, collections.abc.Mapping):
-        items: Iterable[object] = value.values()
+        # A chave vai ao JSON Schema do campo pelo `str`, que escreve o conjunto
+        # dentro dela na ordem de iteração.
+        items: Iterable[object] = [*value.keys(), *value.values()]
     else:  # a Sequence, o que sobra de `_is_structure_class`; o ty não estreita por ele
-        items = cast("Sequence[object]", value)
+        # O cast não age em tempo de execução, e o teste de mutação troca o tipo à toa.
+        items = cast("Sequence[object]", value)  # pragma: no mutate
     inner = path | {id(value)}
     return any(_outside_json(item, inner) for item in items)
 
@@ -2780,19 +2991,32 @@ class _Descent:
     `forms` guarda a forma do objeto cuja subárvore não apontou para ele nem para
     cima dele, ao lado do próprio objeto, para que o `id` não passe a outro
     objeto enquanto a assinatura dura. `containers` traz o `id` dos contêineres
-    abertos desde o objeto aberto mais fundo (ver `_stable`).
+    abertos desde o objeto aberto mais fundo (ver `_stable`). `aliases` traz os
+    apelidos `type` abertos no caminho atual (ver `_named_type_leaf`).
 
     `leaves` diz se a folha passa por `_schema_leaf`. Na forma canônica, sim;
     no `_stable` chamado sem descida, como o dos `model_kwargs`, a folha fica
     como veio, e a descida serve só à guarda de ciclo dos contêineres.
     """
 
+    # Declarados na classe, como em `_SnapshotWriter`: sem isso, o typecheck do
+    # teste de mutação infere o tipo de `leaves` também pelo `self.leaves = None`
+    # do `__init__` mutado, e acusa o `if descent.leaves` de `_stable`, que não
+    # foi mutado.
+    leaves: bool
+    depth: dict[int, int]
+    lowest: list[int]
+    forms: dict[int, tuple[object, object]]
+    containers: set[int]
+    aliases: list[object]
+
     def __init__(self, *, leaves: bool = True) -> None:
         self.leaves = leaves
-        self.depth: dict[int, int] = {}
-        self.lowest: list[int] = []
-        self.forms: dict[int, tuple[object, object]] = {}
-        self.containers: set[int] = set()
+        self.depth = {}
+        self.lowest = []
+        self.forms = {}
+        self.containers = set()
+        self.aliases = []
 
     def reach(self, depth: int) -> None:
         """Registra, no objeto aberto mais fundo, um marcador que aponta para `depth`."""
@@ -2803,13 +3027,23 @@ class _Descent:
 def _schema_leaf(value: object, descent: _Descent) -> object:
     """Folha da forma canônica: tipo pelo nome e conteúdo, chamável pelo código.
 
-    O que não é tipo vai a `_callable_leaf`.
+    O NewType, o apelido `type` e o TypeVar entram pelo tipo a que se referem
+    (`_resolved`), como a anotação escrita direto com ele. O apelido recursivo
+    volta a si mesmo, e ali entra por um marcador com o nome
+    (`_named_type_leaf`). O que não é tipo vai a `_callable_leaf`.
     """
-    if get_origin(value) is not None:
-        return {
-            "origin": _schema_leaf(get_origin(value), descent),
-            "args": _stable(get_args(value), descent),
-        }
+    resolved = _resolved(value)
+    if resolved is not value:
+        return _named_type_leaf(value, resolved, descent)
+    origin = get_origin(value)
+    if origin is Union:
+        # `X | Y` e `Union[X, Y]` são a mesma união, e antes do 3.14 têm origens
+        # diferentes: as duas grafias assinam pela de `X | Y`, que é uma classe e
+        # entra pelo nome. A de `Union` entraria pelo código de uma função
+        # interna do `typing`, que muda com a versão do Python.
+        origin = UnionType
+    if origin is not None:
+        return {"origin": _schema_leaf(origin, descent), "args": _stable(get_args(value), descent)}
     if isinstance(value, type) and issubclass(value, BaseModel):
         # Os campos dele já entram pelo caminho; aqui, o que o JSON Schema tiraria
         # da classe: o título, a descrição e o model_config.
@@ -2826,6 +3060,16 @@ def _schema_leaf(value: object, descent: _Descent) -> object:
     if isinstance(value, type):
         return value.__name__
     return _callable_leaf(value, descent)
+
+
+def _named_type_leaf(named: object, resolved: object, descent: _Descent) -> object:
+    """A forma de `resolved`, o tipo a que `named` se refere, ou o marcador de `named` já aberto."""
+    if named in descent.aliases:
+        return {"cycle": _stable_repr(named)}
+    descent.aliases.append(named)
+    form = _stable(resolved, descent)
+    descent.aliases.pop()
+    return form
 
 
 def _callable_leaf(value: object, descent: _Descent) -> object:
@@ -2865,7 +3109,63 @@ def _callable_leaf(value: object, descent: _Descent) -> object:
             "callable": _callable_leaf(call, descent),
             "state": _instance_state(value, descent),
         }
+    return _record_form(value, descent)
+
+
+def _is_record(value: object) -> bool:
+    """Se o valor é instância de dataclass ou de modelo Pydantic, que o Pydantic escreve pelos campos."""
+    return isinstance(value, BaseModel) or (
+        dataclasses.is_dataclass(value) and not isinstance(value, type)
+    )
+
+
+def _record_fields(value: object) -> list[object]:
+    """Os valores dos campos da dataclass ou do modelo Pydantic."""
+    names = (
+        type(value).model_fields
+        if isinstance(value, BaseModel)
+        else [field.name for field in dataclasses.fields(cast("Any", value))]
+    )
+    return [_attribute_or_none(value, name) for name in names]
+
+
+def _record_form(value: object, descent: _Descent) -> object:
+    """A dataclass ou o modelo cujo repr muda de um processo a outro, pelos atributos; o resto, como veio.
+
+    O repr escreve o conjunto que um campo guarda na ordem de iteração, que muda
+    com a semente de hash do processo (`_holds_unordered_set`). O registro sem
+    esse conjunto fica pelo repr, como o checkpoint já gravado com ele.
+    """
+    if _is_record(value) and _holds_unordered_set(value):
+        return {"record": type(value).__qualname__, "state": _instance_state(value, descent)}
     return value
+
+
+def _holds_unordered_set(value: object, path: frozenset[int] = frozenset()) -> bool:
+    """Se o valor tem um conjunto que não é só de inteiros, em qualquer nível.
+
+    Desce pelas coleções de `_is_structure_class`, como a tupla, a lista e o
+    deque, pelas chaves e pelos valores do Mapping e pelos campos do registro
+    (`_is_record`). O hash do inteiro é o próprio valor, e o conjunto só de
+    inteiros itera na mesma ordem em todo processo. `path` traz o `id` do que
+    está aberto acima do valor: o que volta a ele não é percorrido de novo.
+    """
+    structure = _is_structure_class(type(value))
+    if structure and isinstance(value, collections.abc.Set):
+        return not all(isinstance(item, int) for item in value)
+    if id(value) in path:
+        return False
+    if _is_record(value):
+        items: Iterable[object] = _record_fields(value)
+    elif structure and isinstance(value, collections.abc.Mapping):
+        items = [*value.keys(), *value.values()]
+    elif structure:
+        # O cast não age em tempo de execução, e o teste de mutação troca o tipo à toa.
+        items = cast("Iterable[object]", value)  # pragma: no mutate
+    else:
+        return False
+    inner = path | {id(value)}
+    return any(_holds_unordered_set(item, inner) for item in items)
 
 
 def _python_call(value: object) -> object | None:
@@ -2904,15 +3204,28 @@ def _instance_state(value: object, descent: _Descent) -> object:
         return descent.forms[key][1]
     depth = len(descent.depth)
     descent.depth[key] = depth
-    descent.lowest.append(depth + 1)
+    # O valor inicial só é comparado com profundidades, pelo `min` e pelo
+    # `lowest > depth`, e qualquer valor acima de `depth` dá o mesmo resultado.
+    descent.lowest.append(depth + 1)  # pragma: no mutate
     # O estado do objeto abre um trecho novo de contêineres (ver `_stable`).
     outer, descent.containers = descent.containers, set()
     # No objeto só com `__slots__`, o nome `__dict__` cai no `__getattr__` da
     # classe, que pode devolver qualquer coisa; só o dict é o `__dict__`.
     own = _attribute_or_none(value, "__dict__")
     state = {**(own if isinstance(own, dict) else {}), **_slot_values(value)}
-    if isinstance(value, (pd.DataFrame, pd.Series)):
-        state = {name: item for name, item in state.items() if name not in _TABLE_INTERNALS}
+    if (
+        dataclasses.is_dataclass(value)
+        and not isinstance(value, type)
+        and _holds_unordered_set(value)
+    ):
+        # Um campo init=False pode guardar o default só na classe. Na forma
+        # canônica, ele também precisa entrar pelo valor que a instância lê.
+        for field in dataclasses.fields(cast("Any", value)):
+            if field.name not in state:
+                state[field.name] = _attribute_or_none(value, field.name)
+    if isinstance(value, _PANDAS_OBJECTS):
+        internals = _pandas_internals(type(value))
+        state = {name: item for name, item in state.items() if name not in internals}
     form = _stable(state, descent)
     held = _held_value(value, descent)
     if held is not None:
@@ -2953,14 +3266,15 @@ _VALUE_TYPES = _BUILTIN_VALUE_TYPES + _DATE_VALUE_TYPES
 def _held_value(value: object, descent: _Descent) -> object:
     """O que a instância guarda fora dos atributos, na forma canônica; None no resto.
 
-    A subclasse de DataFrame, Series ou ndarray entra pelos dados inteiros
-    (`_data_form`), que o pandas guarda no `_mgr`, cujo repr só os resume, e o
+    A tabela e o array do pandas e do numpy, inclusive o Index e o array do
+    pandas, entram pelos dados inteiros (`_data_form`), que o pandas guarda no
+    `_mgr` ou no array Arrow, cujo repr só os resume e mostra os blocos, e o
     numpy, no buffer; a subclasse de tipo embutido, pelo valor dele.
     """
-    if isinstance(value, (pd.DataFrame, pd.Series, np.ndarray)):
+    if isinstance(value, _TABLES):
         return _data_form(value, descent)
-    builtin = _builtin_value(value)
-    return None if builtin is None else _stable(builtin, descent)
+    # O `_stable` devolve o None como veio.
+    return _stable(_builtin_value(value), descent)
 
 
 def _builtin_value(value: object) -> object:
@@ -2993,7 +3307,7 @@ def _attribute_or_none(value: object, name: str) -> object:
     primeira linha, e a exceção dela derrubaria a execução inteira.
     """
     try:
-        return getattr(value, name, None)
+        return getattr(value, name)
     except Exception:  # noqa: BLE001 (ver a docstring)
         return None
 
@@ -3054,12 +3368,35 @@ def _code_form(code: CodeType) -> list[object]:
 _ARRAYS = (np.ndarray, pd.Index, ExtensionArray)
 _TABLES = (pd.DataFrame, pd.Series, *_ARRAYS)
 
+_PANDAS_OBJECTS = (pd.DataFrame, pd.Series, pd.Index, ExtensionArray)
+
 # Atributos que o próprio pandas guarda na instância do DataFrame e da Series:
 # os dados, que entram por `_data_form`, e o que muda com o uso ou com o arranjo
 # dos blocos, como o `_item_cache` do pandas 2 e o repr do `_mgr`.
 _TABLE_INTERNALS = frozenset(
     name for plain in (pd.DataFrame(), pd.Series(dtype=object)) for name in vars(plain)
 )
+_INDEX_INTERNALS = frozenset(vars(pd.Index([])))
+
+
+def _pandas_internals(cls: type) -> frozenset[str]:
+    """Atributos que o pandas guarda na instância da classe dele ou de uma subclasse.
+
+    No DataFrame e na Series, os do DataFrame e da Series vazios. No Index e no
+    array do pandas, os do Index vazio, entre eles o `_cache` que o
+    `cache_readonly` preenche com o uso, e os que as classes do pandas na MRO
+    declaram, como o `_pa_array` do array Arrow, cujo repr mostra o arranjo
+    dos blocos.
+    """
+    if issubclass(cls, (pd.DataFrame, pd.Series)):
+        return _TABLE_INTERNALS
+    declared = (
+        name
+        for base in cls.__mro__
+        if base.__module__.partition(".")[0] == "pandas"
+        for name in inspect.get_annotations(base)
+    )
+    return _INDEX_INTERNALS | set(declared)
 
 
 def _stable(value: object, descent: _Descent | None = None) -> object:
@@ -3083,7 +3420,8 @@ def _stable(value: object, descent: _Descent | None = None) -> object:
     mais fundo, e por isso não decide se a forma desse objeto é reaproveitada.
     """
     if descent is None:
-        descent = _Descent(leaves=False)
+        # `leaves` só é lido como condição, e o None no lugar do False daria o mesmo.
+        descent = _Descent(leaves=False)  # pragma: no mutate
     # O chamável vem antes do contêiner: o NamedTuple com `__call__` entraria
     # pela lista dos valores, sem o código, e a subclasse de dict, só pelos itens.
     # `_callable_leaf` o lê pelo `__call__` e pelo valor embutido ao lado do estado.
@@ -3091,7 +3429,7 @@ def _stable(value: object, descent: _Descent | None = None) -> object:
     if descent.leaves and (not is_container or _python_call(value) is not None):
         return _schema_leaf(value, descent)
     if not is_container:
-        return value
+        return _record_form(value, descent)
     key = id(value)
     if key in descent.containers:
         return {"cycle": type(value).__name__}
@@ -3103,7 +3441,9 @@ def _stable(value: object, descent: _Descent | None = None) -> object:
     elif isinstance(value, collections.abc.Set):
         form = sorted((_stable(item, descent) for item in value), key=_stable_repr)
     else:  # a Sequence, o que sobra de `_is_structure_class`; o ty não estreita por ele
-        form = [_stable(item, descent) for item in cast("Sequence[object]", value)]
+        # O cast não age em tempo de execução, e o teste de mutação troca o tipo à toa.
+        items = cast("Sequence[object]", value)  # pragma: no mutate
+        form = [_stable(item, descent) for item in items]
     descent.containers.remove(key)
     return form
 
@@ -3111,27 +3451,34 @@ def _stable(value: object, descent: _Descent | None = None) -> object:
 def _key_form(name: object, descent: _Descent) -> str:
     """Chave de Mapping pelo `str`, sem o endereço de memória que ele leve.
 
-    O conjunto, sozinho ou dentro de uma tupla, entra pela lista ordenada, e não
-    pela ordem de iteração, que muda com a semente de hash do processo. A tupla
-    sem conjunto entra pelo `str` dela.
+    O conjunto, sozinho ou dentro de uma tupla, de uma dataclass ou de um
+    modelo, entra pela lista ordenada, e não pela ordem de iteração, que muda
+    com a semente de hash do processo (ver `_record_form`). A tupla sem conjunto
+    entra pelo `str` dela.
     """
-    if _holds_set(name):
+    if _key_needs_form(name):
         name = _stable(name, descent)
     return _without_address(str(name))
 
 
-def _holds_set(name: object) -> bool:
-    """Se a chave é um conjunto ou uma tupla que contém um, em qualquer nível."""
-    if isinstance(name, (set, frozenset)):
+def _key_needs_form(name: object) -> bool:
+    """Se a chave passa pela forma canônica: o conjunto, o registro com conjunto de texto, e a tupla que contém um deles.
+
+    O registro sem esse conjunto (`_holds_unordered_set`) fica pelo `str`,
+    também dentro da tupla, como no checkpoint já gravado com ele.
+    """
+    if isinstance(name, (set, frozenset)) or (_is_record(name) and _holds_unordered_set(name)):
         return True
-    return isinstance(name, tuple) and any(_holds_set(item) for item in name)
+    return isinstance(name, tuple) and any(_key_needs_form(item) for item in name)
 
 
-def _data_form(value: object, descent: _Descent) -> object:
+def _data_form(
+    value: pd.DataFrame | pd.Series | np.ndarray | pd.Index | ExtensionArray, descent: _Descent
+) -> object:
     """DataFrame e Series por `_table_form`; ndarray, Index e array do pandas, por `_array_form`."""
     if isinstance(value, (pd.DataFrame, pd.Series)):
         return _table_form(value, descent)
-    return _array_form(cast("np.ndarray | pd.Index | ExtensionArray", value), descent)
+    return _array_form(value, descent)
 
 
 def _table_form(value: pd.DataFrame | pd.Series, descent: _Descent) -> object:
@@ -3172,7 +3519,7 @@ def _array_form(value: np.ndarray | pd.Index | ExtensionArray, descent: _Descent
         cells = _column_cells(value.to_series(), descent)
     elif not isinstance(value, np.ndarray):
         cells = _column_cells(pd.Series(value), descent)
-    elif value.dtype.names or _extended(value.dtype):
+    elif bool(value.dtype.names) or _extended(value.dtype):
         cells = _stable(value.tolist(), descent)
     elif value.dtype.hasobject:
         cells = _column_cells(pd.Series(np.asarray(value).ravel()), descent)
@@ -3193,6 +3540,15 @@ def _dtype_form(dtype: object, descent: _Descent) -> object:
     return str(dtype)
 
 
+# Os tipos que o `hash_pandas_object` lê pelos valores: bool, int, uint, timedelta,
+# datetime, float e complex (o float e o complex estendidos ficam de fora, ver
+# `_extended`).
+_HASHED_KINDS = frozenset("biumMfc")
+# O maior float e o maior complex que o `hash_pandas_object` lê, em bytes.
+_FLOAT64_SIZE = np.dtype(np.float64).itemsize
+_COMPLEX128_SIZE = np.dtype(np.complex128).itemsize
+
+
 def _column_cells(column: pd.Series, descent: _Descent) -> object:
     """Células da coluna, na ordem, por um valor que não muda de um processo a outro.
 
@@ -3211,20 +3567,30 @@ def _column_cells(column: pd.Series, descent: _Descent) -> object:
     """
     if isinstance(column.dtype, pd.CategoricalDtype):
         column = column.cat.codes
-    kind = column.dtype.kind
-    hashable = (kind in "biumMfc" and not _extended(column.dtype)) or infer_dtype(
-        column, skipna=False
+    hashable = (column.dtype.kind in _HASHED_KINDS and not _extended(column.dtype)) or infer_dtype(
+        column,
+        skipna=False,
     ) == "string"
     if not hashable:
         return _stable(column.tolist(), descent)
-    cells = hash_pandas_object(column, index=False).to_numpy()
+    cells = hash_pandas_object(
+        column,
+        index=False,
+    ).to_numpy()
     return hashlib.sha256(cells.tobytes()).hexdigest()
 
 
-def _extended(dtype: object) -> bool:
-    """Se o tipo é float ou complex estendido, como o `longdouble`, maior que o de 64 bits."""
-    kind, itemsize = getattr(dtype, "kind", ""), getattr(dtype, "itemsize", 0)
-    return (kind == "f" and itemsize > 8) or (kind == "c" and itemsize > 16)  # noqa: PLR2004 (float64, complex128)
+def _extended(dtype: np.dtype | ExtensionDtype) -> bool:
+    """Se o tipo é float ou complex estendido, como o `longdouble`, maior que o de 64 bits.
+
+    O tipo do pandas sem `itemsize`, como o esparso, não é estendido.
+    """
+    itemsize = getattr(dtype, "itemsize", None)
+    if itemsize is None:
+        return False
+    return (dtype.kind == "f" and itemsize > _FLOAT64_SIZE) or (
+        dtype.kind == "c" and itemsize > _COMPLEX128_SIZE
+    )
 
 
 def _stable_repr(value: object) -> str:
@@ -3261,20 +3627,19 @@ def _write_checkpoint_signature(path: Path, meta: dict[str, Any]) -> None:
     target = _signature_path(path)
     tmp = target.with_name(target.name + ".tmp")
     try:
-        tmp.write_text(json.dumps({**meta, "checkpoint": _file_hash(path)}), encoding="utf-8")
+        tmp.write_bytes(json.dumps({**meta, "checkpoint": _file_hash(path)}).encode())
         tmp.replace(target)
     except OSError as error:
         warnings.warn(
             f"Falha ao gravar a assinatura do checkpoint em {target}: {error}. "
             "O checkpoint é gravado, mas não será retomado automaticamente.",
-            UserWarning,
             stacklevel=_user_stacklevel(),
         )
 
 
 def _read_checkpoint_signature(path: Path) -> dict[str, Any] | None:
     try:
-        meta = json.loads(_signature_path(path).read_text(encoding="utf-8"))
+        meta = json.loads(_signature_path(path).read_bytes())
     except (OSError, ValueError):
         return None
     return meta if isinstance(meta, dict) else None
@@ -3354,7 +3719,7 @@ def _raise_if_overwritten(  # noqa: PLR0913 (as configurações da execução qu
     ]
     if not candidates:
         return
-    has_text = ~df[text_column].map(_is_missing_text).to_numpy(dtype=bool)
+    has_text = ~df[text_column].map(_is_missing_text).astype(bool).to_numpy()
     new_rows = has_text if pending is None else has_text & pending
     overwritten = [
         col for col in candidates if _holds_value(df, col, df[col][new_rows], nan_columns)
@@ -3453,12 +3818,13 @@ def _resume_from_checkpoint(  # noqa: PLR0913 (a entrada, o checkpoint e a confi
     parquet.
     """
     reason, saved = _checkpoint_mismatch(df, checkpoint, questions, status_col=status_col)
-    if reason is not None or saved is None:
+    # _checkpoint_mismatch só devolve o checkpoint lido quando não há motivo
+    # para recusá-lo.
+    if saved is None:
         warnings.warn(
             f"O checkpoint em {checkpoint.path} {reason}; esta execução começa do zero e o "
             "sobrescreve. Para retomá-lo mesmo assim, carregue-o com read_df e "
             "passe-o como entrada.",
-            UserWarning,
             stacklevel=_user_stacklevel(),
         )
         return frozenset()
@@ -3470,7 +3836,9 @@ def _resume_from_checkpoint(  # noqa: PLR0913 (a entrada, o checkpoint e a confi
         reprocessed_columns,
         nan_columns,
         text_column=text_column,
-        status_col=status_col,
+        # Com `pending`, a checagem não lê o status_col, que só entra na mensagem
+        # da entrada sem coluna de status; o teste de mutação o troca à toa.
+        status_col=status_col,  # pragma: no mutate
         pending=~concluded,
     )
     by_name = {str(column): column for column in df.columns}
@@ -3494,17 +3862,25 @@ def _resume_from_checkpoint(  # noqa: PLR0913 (a entrada, o checkpoint e a confi
         # porque o pandas 3 infere a coluna de texto como `str`, que troca o
         # None por NaN. Na coluna relida com outro dtype, como o float64 do
         # parquet, a célula nula é o None que a execução gravou, e nos objetos
-        # o NaN contaria como valor.
+        # o NaN contaria como valor. Na coluna de objetos, `read_df` já devolve
+        # None na célula ausente, e o NaN que resta é o que o modelo devolveu.
+        # O np.empty de objetos começa com None em toda célula.
         if target is None:
-            values = pd.Series([None] * len(df), dtype=object).to_numpy().copy()
+            values = np.empty(len(df), dtype=object)
+            target = column
         else:
             values = df[target].to_numpy(dtype=object).copy()
-        saved_values = saved[column].to_numpy(dtype=object)
+        # Cópia: o array da coluna de objetos é o da própria coluna, só de leitura.
+        saved_values = saved[column].to_numpy(dtype=object, copy=True)
         if saved[column].dtype != object:
             saved_values[saved[column].isna().to_numpy()] = None
         values[concluded] = saved_values[concluded]
-        df[column if target is None else target] = pd.Series(
-            values, index=df.index, dtype=object, copy=False
+        df[target] = pd.Series(
+            values,
+            index=df.index,
+            dtype=object,
+            # copy só decide se o pandas copia `values`, que é um array novo.
+            copy=False,  # pragma: no mutate
         )
     if checkpoint.path.suffix.lower() not in _EMPTY_TEXT_AS_ABSENT_EXTS:
         return frozenset()
@@ -3559,7 +3935,7 @@ def _default_may_be_none(field: FieldInfo) -> bool:
     como ausente, e a validação da linha chamaria a fábrica, que levantaria
     na retomada.
     """
-    if field.default_factory_takes_validated_data:
+    if field.default_factory_takes_validated_data is True:
         return True
     try:
         return field.get_default(call_default_factory=True) is None
@@ -3595,7 +3971,61 @@ def _array_as_list(value: object) -> object:
     return value
 
 
-def _structures_as_json(df: pd.DataFrame, columns: Collection[str] | None = None) -> pd.DataFrame:
+def _enum_as_value(value: object) -> object:
+    return value.value if isinstance(value, Enum) else value
+
+
+def _structure_as_json(value: object) -> object:
+    value = _array_as_list(value)
+    if _is_structure_class(type(value)):
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            default=_json_default,
+        )
+    return _enum_as_value(value)
+
+
+def _cell_for_checkpoint(  # noqa: PLR0913 (uma opção por forma de gravar a célula)
+    value: object,
+    *,
+    structures: bool,
+    any_text: bool,
+    text_file: bool,
+    decimal_text: bool,
+    nan_text: bool,
+    scalar_text: bool,
+) -> object:
+    """A célula de uma coluna de objeto como o checkpoint a grava (`_structures_as_json`)."""
+    if decimal_text and isinstance(value, Decimal):
+        return str(value)
+    if nan_text and isinstance(value, float) and math.isnan(value):
+        return _FLOAT_NAN_TEXT
+    if scalar_text and isinstance(value, str):
+        return _quoted_scalar_text(value)
+    # No campo que também é `Any`, o escape de `any_text` abaixo já põe o texto
+    # "NaN" entre aspas, e o texto que se leria como estrutura precisa dele.
+    if nan_text and not any_text and isinstance(value, str):
+        return _quoted_nan_text(value)
+    if (
+        any_text
+        and isinstance(value, str)
+        and (_any_from_text(value) is not value or (text_file and _reads_as_other(value)))
+    ):
+        return json.dumps(value, ensure_ascii=False)
+    return _structure_as_json(value) if structures else _enum_as_value(value)
+
+
+def _structures_as_json(  # noqa: PLR0913, PLR0917 (uma família de colunas por forma de gravar)
+    df: pd.DataFrame,
+    columns: Collection[str] | None = None,
+    any_columns: Collection[str] = (),
+    nan_columns: Collection[str] = (),
+    decimal_columns: Collection[str] = (),
+    scalar_columns: Collection[str] = (),
+    *,
+    text_file: bool = False,
+) -> pd.DataFrame:
     """Cópia com as coleções de `_is_structure_class` e os arrays do numpy serializados como JSON.
 
     CSV e XLSX gravariam o repr Python ("['a', 'b']"), que json.loads não lê
@@ -3610,24 +4040,48 @@ def _structures_as_json(df: pd.DataFrame, columns: Collection[str] | None = None
 
     Com `columns`, só essas colunas são serializadas; sem, todas as de objeto.
 
+    As de `any_columns`, as dos campos `Any` do modelo, são sempre
+    serializadas, e nelas o texto que `read_df` leria como outro valor
+    (`_any_from_text`), como "[1, 2]", vai como texto JSON entre aspas: o campo
+    aceita o texto e a estrutura, e a célula precisa dizer qual dos dois o
+    modelo devolveu. Com `text_file`, para o CSV e o XLSX, vai entre aspas
+    também o texto que o leitor desses formatos devolveria como número, bool
+    ou ausência (`_reads_as_other`), como "123", "NaN" e "".
+
+    Com `text_file`, o Decimal das `decimal_columns`, as dos campos só de
+    `Decimal`, vai como texto, que o XLSX gravaria como double, e o NaN das
+    `nan_columns`, as dos campos que admitem `float` e dos campos `Any`, vai
+    como o texto "NaN": o CSV e o XLSX o gravariam como a célula vazia da
+    linha pendente. O texto "NaN" que o modelo devolveu num campo desses que
+    também admite texto vai com um par de aspas (`_quoted_nan_text`). Nas
+    `scalar_columns`, as da união de texto e número (`_mixes_text_and_number`),
+    vai com um par de aspas todo texto que o leitor devolveria como número,
+    bool ou ausência (`_quoted_scalar_text`). `read_df` com o modelo relê
+    todos (`_raw_restorer`).
+
+    Em qualquer formato, na coluna com um Decimal NaN todo Decimal vai como
+    texto. O pandas conta o Decimal NaN como ausente; o
+    decimal128 do parquet não tem NaN, e a coluna que juntasse Decimal e o
+    texto "NaN" seria recusada. A validação da retomada devolve o texto ao
+    tipo do campo.
+
     O Enum vai pelo valor em toda coluna de objeto, como dentro do JSON: o CSV
     e o XLSX gravariam o texto dele ("Cor.AZUL"), que a validação recusa, e o
     parquet recusa a coluna inteira.
     """
-
-    def enum_as_value(value: object) -> object:
-        return value.value if isinstance(value, Enum) else value
-
-    def to_json(value: object) -> object:
-        value = _array_as_list(value)
-        if _is_structure_class(type(value)):
-            return json.dumps(value, ensure_ascii=False, default=_json_default)
-        return enum_as_value(value)
-
     out = df.copy()
     for col in out.columns:
         if out[col].dtype == object:
-            convert = to_json if columns is None or col in columns else enum_as_value
+            convert = partial(
+                _cell_for_checkpoint,
+                structures=columns is None or col in columns or col in any_columns,
+                any_text=col in any_columns,
+                text_file=text_file,
+                decimal_text=(text_file and col in decimal_columns)
+                or any(isinstance(value, Decimal) and value.is_nan() for value in out[col]),
+                nan_text=text_file and col in nan_columns,
+                scalar_text=text_file and col in scalar_columns,
+            )
             converted = out[col].map(convert)
             # Series.map infere o tipo do resultado, e uma coluna com int ao
             # lado de None ou de float vira float64, que arredonda o int acima
@@ -3644,11 +4098,71 @@ def _structures_as_json(df: pd.DataFrame, columns: Collection[str] | None = None
     return out
 
 
-def _save_checkpoint(
+def _to_parquet_keeping_nan(df: pd.DataFrame, path: Path, nan_columns: Collection[str]) -> None:
+    """Grava o parquet com o NaN das `nan_columns` à parte do nulo.
+
+    O to_parquet do pandas grava como nulo o NaN de uma coluna de objetos, ao
+    lado do None da linha pendente e da resposta None. A coluna de um campo
+    que admite `float`, ou de um campo `Any`, só com número e None e com algum
+    NaN (`_holds_only_number_with_nan`), é refeita na tabela do Arrow como
+    float64, com o NaN como valor; `read_df` com o modelo o relê
+    (`_reread_parquet`). Sem coluna assim, a gravação é a do pandas.
+    """
+    keeping = {
+        col: values
+        for col in df.columns
+        if col in nan_columns
+        and df[col].dtype == object
+        # O isna, vetorizado, poupa a lista da coluna sem NaN nem None.
+        and df[col].isna().any()
+        and _holds_only_number_with_nan(values := df[col].tolist())
+    }
+    if not keeping:
+        df.to_parquet(path, index=False)
+        return
+    import pyarrow as pa  # noqa: PLC0415 (dependência opcional, exigida pelo checkpoint parquet)
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    for col, values in keeping.items():
+        table = table.set_column(
+            table.schema.get_field_index(col),
+            col,
+            # De uma lista de float, int e None, o Arrow infere o float64 e mantém o NaN.
+            pa.array(values),
+        )
+    pq.write_table(table, path)
+
+
+# O maior inteiro até o qual todo inteiro tem um float64 igual a ele.
+_MAX_EXACT_FLOAT_INT = 2**53
+
+
+def _holds_only_number_with_nan(values: list[object]) -> bool:
+    """Se as células são só float, int que o float64 guarda exato e None, com algum NaN.
+
+    O int ao lado de um float já sai float64 da gravação do pandas, e da
+    coluna com nulo o leitor o devolve float. O bool e o int acima de 2**53
+    não têm float64 igual a eles, e a coluna com um deles fica com a gravação
+    do pandas, que grava o NaN como nulo.
+    """
+    return all(
+        value is None
+        or type(value) is float
+        or (type(value) is int and abs(value) <= _MAX_EXACT_FLOAT_INT)
+        for value in values
+    ) and any(isinstance(value, float) and math.isnan(value) for value in values)
+
+
+def _save_checkpoint(  # noqa: PLR0913, PLR0917 (o arquivo e o que a gravação sabe dos campos do modelo)
     df: pd.DataFrame,
     path: Path,
     meta: dict[str, Any] | None = None,
     structures: Collection[str] | None = None,
+    any_fields: Collection[str] = (),
+    nan_fields: Collection[str] = (),
+    decimal_fields: Collection[str] = (),
+    scalar_fields: Collection[str] = (),
 ) -> None:
     """Salva DataFrame em disco com escrita atômica. Formato inferido pela extensão.
 
@@ -3656,19 +4170,34 @@ def _save_checkpoint(
     arquivo que acabou de ser escrito: se o processo morre entre as duas
     gravações, o hash não bate e a retomada recomeça em vez de aceitar o par.
 
-    `structures` são os campos de estrutura do modelo. O parquet serializa só
+    `structures` são os campos de estrutura do modelo, e `any_fields`, os
+    campos `Any`, que recebem estrutura e texto. O parquet serializa só
     eles, que a retomada devolve aos tipos declarados, e grava as demais
     colunas como vieram, salvo o Enum, pelo valor; CSV e XLSX serializam toda
     coluna de objeto, porque gravariam o repr de qualquer estrutura.
+    `nan_fields` são os campos cujo NaN é valor (`_keeps_nan`), gravado à
+    parte da célula vazia, como o dos `any_fields`; `decimal_fields`, os
+    campos só de `Decimal`, que o CSV e o XLSX gravam como texto; e
+    `scalar_fields`, as uniões de texto e número, cujo texto o CSV e o XLSX
+    gravam entre aspas quando o leitor o trocaria.
     """
     ext = path.suffix.lower()
     tmp = path.with_name(path.name + ".tmp")
-    if ext == ".csv":
-        _structures_as_json(df).to_csv(tmp, index=False)
-    elif ext == ".xlsx":
-        _to_excel_as_text(_structures_as_json(df), tmp)
+    nan_fields = {*nan_fields, *any_fields}
+    if ext in (".csv", ".xlsx"):
+        frame = _structures_as_json(
+            df, None, any_fields, nan_fields, decimal_fields, scalar_fields, text_file=True
+        )
+        if ext == ".csv":
+            # O to_csv trata None como False em index, e o teste de mutação faz a troca à toa.
+            frame.to_csv(
+                tmp,
+                index=False,  # pragma: no mutate
+            )
+        else:
+            _to_excel_as_text(frame, tmp)
     elif ext == ".parquet":
-        _structures_as_json(df, structures).to_parquet(tmp, index=False)
+        _to_parquet_keeping_nan(_structures_as_json(df, structures, any_fields), tmp, nan_fields)
     else:
         msg = (
             f"Extensão {ext} não suportada para checkpoint. "
@@ -3690,7 +4219,10 @@ def _to_excel_as_text(df: pd.DataFrame, path: Path) -> None:
     porque a marca é do openpyxl, que o checkpoint .xlsx já exige.
     """
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False)
+        df.to_excel(
+            writer,
+            index=False,
+        )
         for row in next(iter(writer.sheets.values())).iter_rows():
             for cell in row:
                 if cell.data_type == "f":
@@ -3706,7 +4238,16 @@ def _try_save_checkpoint(df: pd.DataFrame, checkpoint: _Checkpoint) -> bool:
     A próxima gravação tenta de novo, com o estado completo.
     """
     try:
-        _save_checkpoint(df, checkpoint.path, checkpoint.meta, checkpoint.structures)
+        _save_checkpoint(
+            df,
+            checkpoint.path,
+            checkpoint.meta,
+            checkpoint.structures,
+            checkpoint.any_fields,
+            checkpoint.nan_fields,
+            checkpoint.decimal_fields,
+            checkpoint.scalar_fields,
+        )
     except Exception as error:  # noqa: BLE001 (ver a docstring)
         warnings.warn(
             f"Falha ao gravar o checkpoint em {checkpoint.path}: {type(error).__name__}: {error}. "
@@ -3733,6 +4274,16 @@ class _Checkpoint:
     # Campos de estrutura do modelo, que o parquet grava como JSON
     # (ver _save_checkpoint); sem eles, toda coluna de objeto.
     structures: frozenset[str] | None = dataclasses.field(default=None, compare=False)
+    # Campos `Any` do modelo, cujo texto e cuja estrutura a gravação separa
+    # (ver _structures_as_json).
+    any_fields: frozenset[str] = dataclasses.field(default=frozenset(), compare=False)
+    # Campos cujo NaN é valor (`_keeps_nan`), gravado à parte da célula vazia.
+    nan_fields: frozenset[str] = dataclasses.field(default=frozenset(), compare=False)
+    # Campos só de `Decimal`, que o CSV e o XLSX gravam como texto.
+    decimal_fields: frozenset[str] = dataclasses.field(default=frozenset(), compare=False)
+    # Uniões de texto e número, cujo texto o CSV e o XLSX gravam entre aspas
+    # quando o leitor o trocaria (`_quoted_scalar_text`).
+    scalar_fields: frozenset[str] = dataclasses.field(default=frozenset(), compare=False)
 
 
 class _SnapshotWriter:
@@ -3745,6 +4296,13 @@ class _SnapshotWriter:
     duas gravações simultâneas no mesmo arquivo temporário.
     """
 
+    # Declarados na classe: sem isso, o typecheck do teste de mutação infere o
+    # tipo de cada atributo também pelas atribuições dos `__init__` mutados,
+    # como `self._lock = None`, e acusa o erro no código que não foi mutado.
+    checkpoint: _Checkpoint
+    last_saved: int
+    _lock: threading.Lock
+
     def __init__(self, checkpoint: _Checkpoint) -> None:
         self.checkpoint = checkpoint
         self.last_saved = 0
@@ -3754,7 +4312,8 @@ class _SnapshotWriter:
         """Grava o snapshot, a menos que um de rótulo maior já tenha sido gravado.
 
         Com `force`, grava também com o rótulo da última gravação, para levar
-        ao arquivo uma mudança que não conta linha, como as marcas do Ctrl-C.
+        ao arquivo uma mudança que não conta linha, como as marcas da saída por
+        exceção.
         """
         with self._lock:
             if label < self.last_saved or (label == self.last_saved and not force):
@@ -3776,8 +4335,8 @@ def _mark_unreached(  # noqa: PLR0913 (as linhas e o que a execução sabe das c
     """Marca as linhas que uma interrupção impediu de processar e diz se alguma mudou.
 
     A linha não alcançada é a que a execução ia processar (`to_process`) e
-    não registrou (`registered`). O abort e o Ctrl-C, no sequencial e no paralelo, marcam por
-    esta mesma definição.
+    não registrou (`registered`). O abort e a exceção que sai do laço, como o
+    Ctrl-C, marcam por esta mesma definição, no sequencial e no paralelo.
 
     A linha já processada que ia ser reprocessada guarda os valores anteriores,
     e o detalhe registra que eles não foram atualizados. Sem reprocess_columns,
@@ -3789,24 +4348,23 @@ def _mark_unreached(  # noqa: PLR0913 (as linhas e o que a execução sabe das c
     demais ficam sem status, inclusive a que tinha 'error' e ia ser refeita,
     para que a retomada as encontre.
     """
-    unreached = np.fromiter((idx not in registered for idx in df.index), bool, len(df))
-    unreached &= np.asarray(to_process, dtype=bool)
-    status = df[status_col].to_numpy(dtype=object)
-    details = df["_error_details"].to_numpy(dtype=object)
+    unreached = np.fromiter((idx not in registered for idx in df.index), bool)
+    unreached &= np.asarray(to_process)
+    status = df[status_col].to_numpy()
+    details = df["_error_details"].to_numpy()
     processed = unreached & (status == "processed")
-    flag = np.zeros(len(df), dtype=bool)
-    if reprocess_columns:
-        flag = processed & (details != _INTERRUPTED_REPROCESS_DETAIL)
+    flag = processed & (details != _INTERRUPTED_REPROCESS_DETAIL) & bool(reprocess_columns)
     clear = unreached & ~processed & ~(pd.isna(status) & pd.isna(details))
     # A linha 'error' sai da verificação na primeira coluna em que tem valor.
     errors = np.flatnonzero(clear & (status == "error"))
     for column in value_columns:
         nan_is_value = _nan_is_value(df, column, nan_columns)
-        cells = df[column].to_numpy(dtype=object)[errors]
+        cells = df[column].to_numpy()[errors]
         holds = np.fromiter(
-            (not _is_absent(cell, nan_is_value=nan_is_value) for cell in cells), bool, len(cells)
+            (not _is_absent(cell, nan_is_value=nan_is_value) for cell in cells), bool
         )
-        clear[errors[holds]] = False
+        # As linhas de `errors` estão marcadas em `clear`; fica só a que não tem valor.
+        clear[errors] = ~holds
         errors = errors[~holds]
     if flag.any():
         df.loc[flag, "_error_details"] = _INTERRUPTED_REPROCESS_DETAIL
@@ -3864,9 +4422,19 @@ def _set_field_traces(df: pd.DataFrame, idx: Hashable, traces: dict[str, object]
     for key, trace in traces.items():
         column = f"_trace_{key}"
         if column not in df.columns:
-            with _silent_slice_write(df):
+            # No pandas 3, o contexto não lê o DataFrame, e trocá-lo por None, como faz o
+            # teste de mutação, não muda nada; no pandas 2, a troca levanta.
+            with _silent_slice_write(df):  # pragma: no mutate
                 df[column] = None
-        _set_cell(df, idx, column, json.dumps(trace, ensure_ascii=False))
+        _set_cell(df, idx, column, _trace_text(trace))
+
+
+def _trace_text(trace: object) -> str:
+    """O rastro em JSON, com o texto não ASCII como está."""
+    return json.dumps(
+        trace,
+        ensure_ascii=False,
+    )
 
 
 def _record_success(  # noqa: PLR0913 (grava cada família de colunas da linha)
@@ -3896,7 +4464,7 @@ def _record_success(  # noqa: PLR0913 (grava cada família de colunas da linha)
 
     written = {}
     for col in expected_columns:
-        if col in extracted and (not only_reprocessed or col in only_reprocessed):
+        if col in extracted and (not bool(only_reprocessed) or col in only_reprocessed):
             _set_cell(df, idx, col, extracted[col])
             written[col] = extracted[col]
 
@@ -3912,12 +4480,13 @@ def _record_success(  # noqa: PLR0913 (grava cada família de colunas da linha)
     _add_usage_stats(token_stats, usage or {})
 
     # Armazenar traces: um por campo ou grupo nos modos por campo, ou um só
-    if trace_mode:
+    if bool(trace_mode):
         if search_config and search_config.per_field:
-            _set_field_traces(df, idx, result.get("traces", {}))
+            # Com trace_mode, a linha passou pelo agente campo a campo, que sempre devolve os traces.
+            _set_field_traces(df, idx, result["traces"])
         else:
             # Com trace_mode, a linha passou por call_agent, que sempre devolve o trace.
-            _set_cell(df, idx, "_trace", json.dumps(result["trace"], ensure_ascii=False))
+            _set_cell(df, idx, "_trace", _trace_text(result["trace"]))
 
     _set_cell(df, idx, status_col, "processed")
     # Registra retries mesmo no sucesso; sem retry, some o erro de uma execução anterior
@@ -3939,8 +4508,13 @@ def _add_failed_usage(token_stats: TokenStats, error: BaseException) -> None:
     em `row_usage` (LangChain sem busca e modo por campo), atributos que o
     backend põe na exceção.
     """
-    _add_usage_stats(token_stats, getattr(error, "row_usage", None) or {})
-    token_stats["cost_usd"] += getattr(error, "cost_usd", 0) or 0
+    failed = _take_failed_usage(error)
+    if failed is not None:
+        _add_usage_stats(token_stats, failed.usage)
+        token_stats["cost_usd"] += failed.cost_usd
+    else:
+        _add_usage_stats(token_stats, getattr(error, "row_usage", None) or {})
+        token_stats["cost_usd"] += getattr(error, "cost_usd", None) or 0
 
 
 def _record_error(  # noqa: PLR0913 (o que a linha grava vem da execução inteira)
@@ -3971,11 +4545,12 @@ def _record_error(  # noqa: PLR0913 (o que a linha grava vem da execução intei
         error_details = f"[Falhou após {config.max_retries} tentativa(s)] {error_msg}"
     else:
         error_details = f"[Erro não-recuperável] {error_msg}"
-    if row_already_processed and reprocess_columns:
+    if row_already_processed and bool(reprocess_columns):
         error_details += _KEPT_VALUES_NOTE
 
     friendly_msg = get_friendly_error_message(error, config.provider)
-    warnings.warn(f"Falha ao processar linha {idx}.\n{friendly_msg}", stacklevel=1)
+    msg = f"Falha ao processar linha {idx}.\n{friendly_msg}"
+    _warn_at_user(msg)
     _set_cell(df, idx, status_col, "error")
     _set_cell(df, idx, "_error_details", error_details)
 
@@ -4042,7 +4617,7 @@ def _record_error_safely(  # noqa: PLR0913 (repassa os parâmetros de _record_er
             token_stats=token_stats,
         )
     except Exception:  # noqa: BLE001 (ver a docstring)
-        kept = _KEPT_VALUES_NOTE if row_already_processed and reprocess_columns else ""
+        kept = _KEPT_VALUES_NOTE if row_already_processed and bool(reprocess_columns) else ""
         _record_unrecorded_error(df, idx, error, status_col=status_col, note=kept)
 
 
@@ -4051,7 +4626,7 @@ def _record_unrecorded_error(
 ) -> None:
     """Marca como erro a linha cuja falha não pôde ser registrada normalmente."""
     error_msg = _error_text(error)
-    warnings.warn(f"Falha ao processar linha {idx}.", stacklevel=1)
+    _warn_at_user(f"Falha ao processar linha {idx}.")
     _set_cell(df, idx, status_col, "error")
     _set_cell(df, idx, "_error_details", f"[Falha ao registrar o erro] {error_msg}{note}")
 
@@ -4076,7 +4651,7 @@ def _progress_suffix(
     df: pd.DataFrame, reprocess_columns: Sequence[str] | None, processed_count: int
 ) -> str:
     """Final do rótulo: colunas reprocessadas ou ponto de retomada."""
-    if reprocess_columns:
+    if bool(reprocess_columns):
         return f" (reprocessando: {', '.join(reprocess_columns)})"
     if processed_count > 0:
         return f" (resumindo de {processed_count}/{len(df)})"
@@ -4097,7 +4672,8 @@ def _sequential_description(
 
 def _row_already_processed(row: pd.Series, status_col: str) -> bool:
     """Se a linha chega 'processed', caso em que reprocess_columns limita o que ela grava."""
-    return bool(pd.notna(row[status_col]) and row[status_col] == "processed")
+    # O status chega normalizado, sem pd.NA (_prepare_frame); upstream #381.
+    return bool(row[status_col] == "processed")
 
 
 class _RowLedger:
@@ -4106,8 +4682,8 @@ class _RowLedger:
     Serve ao laço sequencial de dataframeit e ao de adataframeit. Em nenhum dos
     dois outra linha é gravada durante a gravação do checkpoint, e ela leva o
     próprio DataFrame, sem a cópia do modo paralelo com threads. A linha
-    registrada já está gravada no DataFrame; o abort e a interrupção marcam as
-    demais pela mesma definição (`_mark_unreached`).
+    registrada já está gravada no DataFrame; o abort e a exceção que sai do
+    laço marcam as demais pela mesma definição (`_mark_unreached`).
     """
 
     def __init__(
@@ -4122,8 +4698,10 @@ class _RowLedger:
         self.registered: set[Hashable] = set()
         self.count = 0
         self.saved = 0
-        # Se as marcas da interrupção mudaram o DataFrame, e a gravação deve levá-las.
-        self.marked = False
+        # Se as marcas da saída por exceção mudaram o DataFrame, e a gravação deve
+        # levá-las. Só essa gravação o lê, depois de a marcação o regravar logo de
+        # início, e o teste de mutação troca à toa o valor inicial.
+        self.marked = False  # pragma: no mutate
 
     def register(self, idx: Hashable) -> bool:
         """Registra a linha gravada e diz se ela completa um lote do checkpoint."""
@@ -4135,7 +4713,7 @@ class _RowLedger:
         """Grava o checkpoint se há linha registrada fora dele, ou com `also`.
 
         `also` leva ao arquivo o que não conta linha, como as marcas de uma
-        interrupção. A falha de gravação vira aviso em _try_save_checkpoint, e a
+        interrupção ou da saída por exceção. A falha de gravação vira aviso em _try_save_checkpoint, e a
         próxima gravação tenta de novo com o estado completo.
         """
         if (
@@ -4149,14 +4727,14 @@ class _RowLedger:
         """Marca as linhas que a execução ia processar e não registrou; diz se alguma mudou."""
         return self._mark_unreached(self.registered)
 
-    def mark_on_interrupt(self) -> None:
-        """Marca a linha cuja chamada a interrupção cortou e as seguintes."""
-        # Uma segunda interrupção que corte as marcas ainda grava as que entraram.
+    def mark_on_exception(self) -> None:
+        """Marca a linha cuja chamada a exceção cortou e as seguintes."""
+        # Um Ctrl-C que corte as marcas ainda grava as que entraram.
         self.marked = True
         self.marked = self.mark()
 
 
-def _process_rows(  # noqa: C901, PLR0913 (estado da execução repassado por dataframeit, e um ramo por desfecho da linha)
+def _process_rows(  # noqa: PLR0913 (estado da execução repassado por dataframeit, e um ramo por desfecho da linha)
     df: pd.DataFrame,
     *,
     text_column: str,
@@ -4202,7 +4780,8 @@ def _process_rows(  # noqa: C901, PLR0913 (estado da execução repassado por da
     desc += _progress_suffix(df, reprocess_columns, processed_count)
 
     token_stats = _empty_token_stats()
-    # Linhas registradas nesta execução; o abort e o Ctrl-C marcam as demais.
+    # Linhas registradas nesta execução; o abort e a exceção que sai do laço
+    # marcam as demais.
     ledger = _RowLedger(
         df,
         checkpoint,
@@ -4272,28 +4851,33 @@ def _process_rows(  # noqa: C901, PLR0913 (estado da execução repassado por da
                 )
         return success, values
 
-    def save_on_ctrl_c() -> None:
-        """Grava as linhas registradas e as marcas do Ctrl-C que a última gravação não levou."""
+    def save_on_exception() -> None:
+        """Grava as linhas registradas e as marcas que a última gravação não levou."""
         ledger.save(also=bool(token_stats.get("abort")) or ledger.marked)
 
-    # Ctrl-C: grava as linhas registradas desde a última gravação, que a
-    # retomada pagaria de novo, e relança a interrupção. A linha cuja chamada
-    # foi cortada não chegou a ser registrada; ela e as seguintes são marcadas
-    # como na interrupção por ProviderAbortError, e as marcas também vão ao
-    # arquivo. O Ctrl-C que corta a gravação final a refaz. A falha de gravação
-    # vira aviso em _try_save_checkpoint e não troca a interrupção.
-    with _on_ctrl_c(ledger.mark_on_interrupt, save_on_ctrl_c):
-        rows = tqdm(df.iterrows(), total=len(df), desc=desc)
-        for (idx, row), chosen in zip(rows, to_process, strict=True):
-            if not chosen:
-                continue
+    # Exceção que sai do laço, como o Ctrl-C ou um aviso tratado como erro:
+    # grava as linhas registradas desde a última gravação, que a retomada
+    # pagaria de novo, e relança a exceção. A linha cuja chamada foi cortada não
+    # chegou a ser registrada; ela e as seguintes são marcadas como na
+    # interrupção por ProviderAbortError, e as marcas também vão ao arquivo. O
+    # Ctrl-C que corta a gravação final a refaz. A falha dessa gravação não
+    # troca a exceção que sai; ver _on_exception.
+    # A barra fecha na saída do bloco, depois das marcas e de toda gravação;
+    # ver _ProgressBar. Sem o fechamento, ela ficaria aberta até o coletor de
+    # lixo fechá-la, no meio de outra execução.
+    with (
+        _ProgressBar(total=len(df), desc=desc) as pbar,
+        _on_exception(ledger.mark_on_exception, save_on_exception),
+    ):
+        for idx, row in itertools.compress(pbar.track(df.iterrows()), to_process):
             started = time.monotonic()
             success, values = process_row(idx, row)
             if "abort" in token_stats:
                 break
 
-            # A linha conta antes do callback: um Ctrl-C dentro dele chega com a
-            # linha já gravada no DataFrame, e a gravação do Ctrl-C a leva.
+            # A linha conta antes do callback: a exceção que sai dele, como um
+            # Ctrl-C, chega com a linha já gravada no DataFrame, e a gravação
+            # da saída a leva.
             position = ledger.count
             save_due = ledger.register(idx)
             _notify_row_done(
@@ -4320,25 +4904,85 @@ def _process_rows(  # noqa: C901, PLR0913 (estado da execução repassado por da
     return token_stats
 
 
-@contextmanager
-def _on_ctrl_c(
-    mark: Callable[[], object],
-    save: Callable[[], object],
-    interruptions: tuple[type[BaseException], ...] = (KeyboardInterrupt,),
-) -> Generator[None, None, None]:
-    """Chama `mark` e `save` quando uma interrupção atravessa o bloco, e a relança.
+class _ProgressBar:
+    """Barra de progresso do laço das linhas, que não interrompe a execução.
 
-    A interrupção é o KeyboardInterrupt e, no laço assíncrono, também o
-    cancelamento da tarefa. `save` roda também quando um segundo Ctrl-C corta
-    `mark`.
+    A barra é só apresentação: a falha ao criá-la, avançá-la ou fechá-la, como
+    o BrokenPipeError de um stderr que o leitor fechou, não sai daqui. As
+    linhas seguem sendo processadas e gravadas, e o resultado ou a interrupção
+    chegam a quem chamou. A primeira falha vira um aviso na saída do bloco,
+    que os laços põem por fora das marcas e das gravações: nem o aviso
+    tratado como erro as impede. `bar_class` é a barra do tqdm; o laço
+    assíncrono passa a que não abre a thread de monitoramento.
+    """
+
+    def __init__(self, *, total: int, desc: str, bar_class: type[tqdm] = tqdm) -> None:
+        self._failure: str | None = None
+        self._bar: tqdm | None = None
+        with self._tolerating_failure():
+            self._bar = bar_class(total=total, desc=desc)
+
+    @contextmanager
+    def _tolerating_failure(self) -> Generator[None, None, None]:
+        try:
+            yield
+        except Exception as e:  # noqa: BLE001 (nenhuma falha da barra interrompe a execução)
+            if self._failure is None:
+                self._failure = _error_text(e)
+
+    def update(self) -> None:
+        """Avança a barra em uma linha."""
+        if self._bar is not None:
+            with self._tolerating_failure():
+                self._bar.update(1)
+
+    def track(
+        self, rows: Iterable[tuple[Hashable, pd.Series]]
+    ) -> Generator[tuple[Hashable, pd.Series], None, None]:
+        """Entrega as linhas e avança a barra quando o laço pede a seguinte."""
+        for row in rows:
+            yield row
+            self.update()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self._bar is not None:
+            with self._tolerating_failure():
+                self._bar.close()
+        if self._failure is not None:
+            _warn_at_user(
+                f"Falha na barra de progresso, que não interrompeu a execução: {self._failure}"
+            )
+
+
+@contextmanager
+def _on_exception(
+    mark: Callable[[], object], save: Callable[[], object]
+) -> Generator[None, None, None]:
+    """Chama `mark` e `save` quando uma exceção atravessa o bloco, e a relança.
+
+    Vale para toda exceção que sai do laço das linhas: o Ctrl-C, o aviso
+    tratado como erro (`-W error`) e o `SystemExit` de um callback. As linhas
+    já processadas chegam ao checkpoint antes de a exceção sair de
+    `dataframeit()`. `save` roda também quando um Ctrl-C corta `mark`.
+
+    A falha de `save` não troca a exceção que sai. A de gravação já vira aviso
+    em _try_save_checkpoint; com o aviso tratado como erro, ele sairia no lugar
+    da exceção original, e por isso entra nela como nota. Um Ctrl-C durante
+    `save` sai como chegou.
     """
     try:
         yield
-    except interruptions:
+    except BaseException as leaving:
         try:
             mark()
         finally:
-            save()
+            try:
+                save()
+            except Exception as failure:  # noqa: BLE001 (ver a docstring)
+                leaving.add_note(f"Na saída por esta exceção: {_error_text(failure)}")
         raise
 
 
@@ -4353,7 +4997,7 @@ def _closing_in_slices(max_workers: int) -> Generator[ThreadPoolExecutor, None, 
     cancelada não é paga e fica sem status, para a retomada. Isso cobre o
     Ctrl-C que sai de dentro do `Thread.start()`, com a thread já lançada e
     ainda sem marcar o início; sem o cancelamento, ela começaria depois da
-    gravação do checkpoint e pagaria fora dele a linha da fila. Fora do Ctrl-C,
+    gravação do checkpoint e pagaria fora dele a linha da fila. Sem exceção,
     a saída chega com a fila vazia, porque o laço espera todos os futuros em
     voo.
 
@@ -4404,16 +5048,15 @@ def _is_rate_limit_safely(error: Exception) -> bool:
     try:
         return is_rate_limit_error(error)
     except Exception:  # noqa: BLE001 (ver a docstring)
-        return False
+        # Quem chama só o lê num `if`, e o None que o teste de mutação põe no
+        # lugar é também falso.
+        return False  # pragma: no mutate
 
 
 def _halved_workers(current_workers: int) -> int:
     """Teto de linhas em voo depois de um rate limit: a metade, com aviso."""
     reduced = max(1, current_workers // 2)
-    warnings.warn(
-        f"Rate limit detectado! Reduzindo workers de {current_workers} para {reduced}.",
-        stacklevel=3,
-    )
+    _warn_at_user(f"Rate limit detectado! Reduzindo workers de {current_workers} para {reduced}.")
     return reduced
 
 
@@ -4472,15 +5115,20 @@ def _process_rows_parallel(  # noqa: C901, PLR0913, PLR0915 (estado compartilhad
     lock = threading.Lock()
     current_workers = parallel_requests
     initial_workers = parallel_requests
-    workers_reduced = False
     rate_limit_event = threading.Event()
     abort_event = threading.Event()
     # Linhas gravadas e contadas pelas threads; a coleta só marca como erro a
     # que escapou antes disso, e não a que falhou depois, ao gravar o snapshot.
-    # O abort e o Ctrl-C marcam as demais.
+    # O abort e a exceção que sai do laço marcam as demais.
     counted: set[Hashable] = set()
-    # Se as marcas do Ctrl-C mudaram o DataFrame, e a gravação deve levá-las.
-    marked = False
+    # Se as marcas da saída por exceção mudaram o DataFrame, e a gravação deve
+    # levá-las. Só essa gravação o lê, depois de a marcação o regravar logo de
+    # início, e o teste de mutação troca à toa o valor inicial.
+    marked = False  # pragma: no mutate
+    # Se a parada guardada em token_stats["abort"] é a da cota esgotada. A
+    # primeira parada o define antes de qualquer leitura, e o teste de mutação
+    # troca à toa o valor inicial.
+    quota_abort = False  # pragma: no mutate
     checkpoint_counter = 0
     # A gravação do checkpoint não segura `lock`, para que as threads que
     # processam linhas sigam durante a I/O. Cada snapshot é copiado sob `lock`
@@ -4525,6 +5173,8 @@ def _process_rows_parallel(  # noqa: C901, PLR0913, PLR0915 (estado compartilhad
     if not rows_to_process:
         return token_stats
 
+    warning_site = _user_warning_site()
+
     def _finish(  # noqa: PLR0913 (o que a linha gravou, repassado ao RowResult)
         row_data: _RowData,
         started: float,
@@ -4554,9 +5204,29 @@ def _process_rows_parallel(  # noqa: C901, PLR0913, PLR0915 (estado compartilhad
         if snapshot is not None:
             snapshot()
 
+    def record_abort(error: ProviderAbortError) -> None:
+        """Guarda o motivo da parada, soma o uso da linha e para o despacho.
+
+        A cota esgotada passa à frente de outra parada que chegou antes dela,
+        porque a orientação dela (`_abort_reason`) é o que resolve a retomada,
+        e a outra parada vem depois dela no motivo.
+        """
+        nonlocal quota_abort
+        with lock:
+            quota = isinstance(error, ProviderUsageLimitError)
+            reason = _abort_reason(error)
+            if "abort" not in token_stats:
+                token_stats["abort"] = reason
+                quota_abort = quota
+            elif quota and not quota_abort:
+                token_stats["abort"] = f"{reason}. Antes, outra linha parou: {token_stats['abort']}"
+                quota_abort = True
+            _add_failed_usage(token_stats, error)
+        abort_event.set()
+
     def process_single_row(row_data: _RowData) -> None:
         """Processa uma única linha (executada em thread separada)."""
-        nonlocal current_workers, workers_reduced
+        nonlocal current_workers
 
         started = time.monotonic()
         _position, idx, row = row_data
@@ -4614,17 +5284,13 @@ def _process_rows_parallel(  # noqa: C901, PLR0913, PLR0915 (estado compartilhad
                 snapshot = _count_row(idx)
 
         except ProviderAbortError as e:
-            with lock:
-                token_stats.setdefault("abort", _abort_reason(e))
-                _add_failed_usage(token_stats, e)
-            abort_event.set()
+            record_abort(e)
             return
         except Exception as e:  # noqa: BLE001 (qualquer falha da linha vira status 'error')
             if _is_rate_limit_safely(e):
                 with lock:
                     if current_workers > 1:
                         current_workers = _halved_workers(current_workers)
-                        workers_reduced = True
                         rate_limit_event.set()
                         # Limpar evento após um tempo
                         threading.Timer(_RATE_LIMIT_WINDOW_SECONDS, rate_limit_event.clear).start()
@@ -4649,8 +5315,16 @@ def _process_rows_parallel(  # noqa: C901, PLR0913, PLR0915 (estado compartilhad
         if config.rate_limit_delay > 0:
             time.sleep(config.rate_limit_delay)
 
+    def process_with_warning_site(row_data: _RowData) -> None:
+        """Leva o local da chamada pública à thread que processa a linha."""
+        _row_warning_site.value = warning_site
+        try:
+            process_single_row(row_data)
+        finally:
+            del _row_warning_site.value
+
     def mark_uncounted_rows() -> None:
-        """Marca no Ctrl-C as linhas que nenhuma thread registrou.
+        """Marca, quando uma exceção sai do laço, as linhas que nenhuma thread registrou.
 
         Como na interrupção por ProviderAbortError, a linha já processada que
         ia ser reprocessada mantém os valores anteriores, com a marca em
@@ -4659,15 +5333,15 @@ def _process_rows_parallel(  # noqa: C901, PLR0913, PLR0915 (estado compartilhad
         """
         nonlocal marked
         with lock:
-            # Um segundo Ctrl-C que corte as marcas ainda grava as que entraram.
+            # Um Ctrl-C que corte as marcas ainda grava as que entraram.
             marked = True
             marked = mark_unreached(counted)
 
     def save_registered_rows() -> None:
-        """Grava o checkpoint no Ctrl-C.
+        """Grava o checkpoint quando uma exceção sai do laço.
 
         O executor espera as linhas em andamento antes de chegar aqui, e elas
-        chegam registradas. Um segundo Ctrl-C durante essa espera deixa threads
+        chegam registradas. Um Ctrl-C durante essa espera deixa threads
         rodando: a cópia sob `lock` leva só as linhas que terminaram, e as
         demais ficam pendentes para a retomada. Pelo rótulo, o _SnapshotWriter
         não regrava o arquivo sem linha contada desde o último snapshot gravado,
@@ -4681,91 +5355,96 @@ def _process_rows_parallel(  # noqa: C901, PLR0913, PLR0915 (estado compartilhad
     # Um executor para a execução inteira. O teto de linhas em voo é
     # current_workers, lido a cada reposição: a redução por rate limit só deixa
     # de despachar, sem cancelar o que já está em voo, e vale até o fim. Na
-    # saída por Ctrl-C, o executor fecha e espera as threads antes de
-    # save_registered_rows gravar: os `with` saem na ordem inversa.
+    # saída por exceção, o executor fecha e espera as threads antes de
+    # save_registered_rows gravar: os `with` saem na ordem inversa. A barra
+    # fecha na saída do bloco de fora, depois das marcas e de toda gravação;
+    # ver _ProgressBar.
     pending_rows = iter(rows_to_process)
     in_flight: dict[Future[None], tuple[_RowData, float]] = {}
-    with (
-        _on_ctrl_c(mark_uncounted_rows, save_registered_rows),
-        tqdm(total=len(rows_to_process), desc=desc) as pbar,
-        _closing_in_slices(parallel_requests) as executor,
-    ):
-        while True:
-            with lock:
-                limit = current_workers
-            while len(in_flight) < limit and not abort_event.is_set():
-                row = next(pending_rows, None)
-                if row is None:
-                    break
-                # A linha que não foi despachada nunca rodou: falhar ao
-                # despachar interrompe a execução e a deixa sem status, para
-                # a retomada. Como 'error', o resume=True a preservaria.
-                try:
-                    in_flight[executor.submit(process_single_row, row)] = (row, time.monotonic())
-                except Exception as e:  # noqa: BLE001 (ver o comentário acima)
-                    with lock:
-                        token_stats.setdefault("abort", _error_text(e))
-                    abort_event.set()
-                    break
-
-            if not in_flight:
-                break
-            # A espera tem prazo por causa do polars, que, ao ser importado,
-            # instala um handler de SIGINT com SA_RESTART. Com ele, o kernel
-            # reinicia a espera sem prazo de um lock em vez de interrompê-la, e
-            # o Ctrl-C só viraria KeyboardInterrupt quando uma linha terminasse.
-            # O que corta a espera é haver prazo, e não a duração da fatia: no
-            # Linux, a espera com prazo de um semáforo não é reiniciada nem com
-            # SA_RESTART (ver signal(7)) e volta com EINTR assim que o sinal
-            # chega, e o interpretador levanta o KeyboardInterrupt na hora. A
-            # fatia curta só limita a demora numa plataforma que reinicie também
-            # a espera com prazo. Sem linha terminada no prazo, `done` volta
-            # vazio e o laço só dá a volta: relê o teto e espera de novo.
-            done, _ = wait(in_flight, timeout=_WAIT_SLICE_SECONDS, return_when=FIRST_COMPLETED)
-            for future in done:
-                row, started = in_flight.pop(future)
-                try:
-                    future.result()
-                except Exception as e:  # noqa: BLE001 (falha fora da linha não para a execução)
-                    # Escapou do tratamento da própria linha; sem isto ela
-                    # ficaria sem status e sumiria da saída.
-                    _position, idx, _row = row
-                    if idx in counted:
-                        warnings.warn(
-                            f"Erro inesperado no executor depois de registrar a linha "
-                            f"{idx}, que mantém o status gravado: {_error_text(e)}",
-                            stacklevel=1,
+    with _ProgressBar(total=len(rows_to_process), desc=desc) as pbar:
+        with (
+            _on_exception(mark_uncounted_rows, save_registered_rows),
+            _closing_in_slices(parallel_requests) as executor,
+        ):
+            while True:
+                with lock:
+                    limit = current_workers
+                while len(in_flight) < limit and not abort_event.is_set():
+                    row = next(pending_rows, None)
+                    if row is None:
+                        break
+                    # A linha que não foi despachada nunca rodou: falhar ao
+                    # despachar interrompe a execução e a deixa sem status, para
+                    # a retomada. Como 'error', o resume=True a preservaria.
+                    try:
+                        in_flight[executor.submit(process_with_warning_site, row)] = (
+                            row,
+                            time.monotonic(),
                         )
-                    else:
+                    except Exception as e:  # noqa: BLE001 (ver o comentário acima)
                         with lock:
-                            _record_unrecorded_error(df, idx, e, status_col=status_col)
-                            error = _recorded_error(df, idx)
-                            snapshot = _count_row(idx)
-                        _finish(row, started, snapshot, success=False, error=error, values={})
-                pbar.update(1)
+                            token_stats.setdefault("abort", _error_text(e))
+                        abort_event.set()
+                        break
 
-    # A gravação no Ctrl-C do `with` acima não cobre o que vem depois dele. Um
-    # Ctrl-C durante as marcas de uma interrupção ou durante a gravação final
-    # grava o checkpoint (ou o regrava) antes de ser relançado, e a cauda chega
-    # ao arquivo, como no modo sequencial. O Ctrl-C que corta as marcas as
-    # completa antes de gravar.
-    with _on_ctrl_c(
-        mark_uncounted_rows,
-        partial(_try_save_checkpoint, df, writer.checkpoint) if writer else (lambda: None),
-    ):
-        if abort_event.is_set():
-            mark_unreached(counted)
+                if not in_flight:
+                    break
+                # A espera tem prazo por causa do polars, que, ao ser importado,
+                # instala um handler de SIGINT com SA_RESTART. Com ele, o kernel
+                # reinicia a espera sem prazo de um lock em vez de interrompê-la, e
+                # o Ctrl-C só viraria KeyboardInterrupt quando uma linha terminasse.
+                # O que corta a espera é haver prazo, e não a duração da fatia: no
+                # Linux, a espera com prazo de um semáforo não é reiniciada nem com
+                # SA_RESTART (ver signal(7)) e volta com EINTR assim que o sinal
+                # chega, e o interpretador levanta o KeyboardInterrupt na hora. A
+                # fatia curta só limita a demora numa plataforma que reinicie também
+                # a espera com prazo. Sem linha terminada no prazo, `done` volta
+                # vazio e o laço só dá a volta: relê o teto e espera de novo.
+                done, _ = wait(in_flight, timeout=_WAIT_SLICE_SECONDS, return_when=FIRST_COMPLETED)
+                for future in done:
+                    row, started = in_flight.pop(future)
+                    try:
+                        future.result()
+                    except Exception as e:  # noqa: BLE001 (falha fora da linha não para a execução)
+                        # Escapou do tratamento da própria linha; sem isto ela
+                        # ficaria sem status e sumiria da saída.
+                        _position, idx, _row = row
+                        if idx in counted:
+                            _warn_at_user(
+                                f"Erro inesperado no executor depois de registrar a linha "
+                                f"{idx}, que mantém o status gravado: {_error_text(e)}",
+                            )
+                        else:
+                            with lock:
+                                _record_unrecorded_error(df, idx, e, status_col=status_col)
+                                error = _recorded_error(df, idx)
+                                snapshot = _count_row(idx)
+                            _finish(row, started, snapshot, success=False, error=error, values={})
+                    pbar.update()
 
-        # Save final: a cauda (< batch_size), o que uma gravação que falhou deixou de
-        # fora e as marcas de uma interrupção, que não contam como linha processada.
-        if writer and (checkpoint_counter > writer.last_saved or abort_event.is_set()):
-            _try_save_checkpoint(df, writer.checkpoint)
+        # A gravação do `with` acima não cobre o que vem depois dele. Uma exceção
+        # durante as marcas de uma interrupção ou durante a gravação final, como
+        # o Ctrl-C, grava o checkpoint (ou o regrava) antes de ser relançada, e
+        # a cauda chega ao arquivo, como no modo sequencial. O Ctrl-C que corta
+        # as marcas as completa antes de gravar.
+        def save_tail() -> None:
+            if writer:
+                _try_save_checkpoint(df, writer.checkpoint)
+
+        with _on_exception(mark_uncounted_rows, save_tail):
+            if abort_event.is_set():
+                mark_unreached(counted)
+
+            # Save final: a cauda (< batch_size), o que uma gravação que falhou deixou de
+            # fora e as marcas de uma interrupção, que não contam como linha processada.
+            if writer and (checkpoint_counter > writer.last_saved or abort_event.is_set()):
+                _try_save_checkpoint(df, writer.checkpoint)
 
     elapsed = time.time() - start_time
     token_stats["elapsed_seconds"] = elapsed
     token_stats["initial_workers"] = initial_workers
     token_stats["final_workers"] = current_workers
-    token_stats["workers_reduced"] = workers_reduced
+    token_stats["workers_reduced"] = current_workers < initial_workers
 
     return token_stats
 
@@ -4880,9 +5559,10 @@ async def _aprocess_rows(  # noqa: C901, PLR0913, PLR0915 (estado da execução 
     da linha na fila, como no modo paralelo. Com um worker, o rótulo da barra e
     o resumo são os do modo sequencial; com mais, os do paralelo.
 
-    O cancelamento da tarefa (`asyncio.CancelledError`) e o Ctrl-C contam como
-    interrupção: a linha em voo não é registrada, as linhas não registradas são
-    marcadas como no abort, o checkpoint é gravado com elas, e a exceção segue.
+    A exceção que sai do laço, como o cancelamento da tarefa
+    (`asyncio.CancelledError`) ou o Ctrl-C, conta como interrupção: a linha em
+    voo não é registrada, as linhas não registradas são marcadas como no abort,
+    o checkpoint é gravado com elas, e a exceção segue.
     """
     started_at = time.time()
     loop = asyncio.get_running_loop()
@@ -4913,6 +5593,29 @@ async def _aprocess_rows(  # noqa: C901, PLR0913, PLR0915 (estado da execução 
             nan_columns=nan_columns,
         ),
     )
+    # Se a parada guardada em token_stats["abort"] é a da cota esgotada. A
+    # primeira parada o define antes de qualquer leitura, e o teste de mutação
+    # troca à toa o valor inicial.
+    quota_abort = False  # pragma: no mutate
+
+    def record_abort(error: ProviderAbortError) -> None:
+        """Guarda o motivo da parada e soma o uso da linha, como no modo paralelo.
+
+        A cota esgotada passa à frente de outra parada que chegou antes dela,
+        porque a orientação dela (`_abort_reason`) é o que resolve a retomada,
+        e a outra parada vem depois dela no motivo.
+        """
+        nonlocal quota_abort
+        quota = isinstance(error, ProviderUsageLimitError)
+        reason = _abort_reason(error)
+        if "abort" not in token_stats:
+            token_stats["abort"] = reason
+            quota_abort = quota
+        elif quota and not quota_abort:
+            token_stats["abort"] = f"{reason}. Antes, outra linha parou: {token_stats['abort']}"
+            quota_abort = True
+        _add_failed_usage(token_stats, error)
+
     # (posição na fila, (índice, linha)) de cada linha a processar.
     pending_rows = enumerate(itertools.compress(df.iterrows(), to_process))
 
@@ -4950,8 +5653,7 @@ async def _aprocess_rows(  # noqa: C901, PLR0913, PLR0915 (estado da execução 
                 token_stats=token_stats,
             )
         except ProviderAbortError as e:
-            token_stats.setdefault("abort", _abort_reason(e))
-            _add_failed_usage(token_stats, e)
+            record_abort(e)
             return None
         except Exception as e:  # noqa: BLE001 (qualquer falha da linha vira status 'error')
             if current_workers > 1 and _is_rate_limit_safely(e):
@@ -5005,7 +5707,7 @@ async def _aprocess_rows(  # noqa: C901, PLR0913, PLR0915 (estado da execução 
         """Se o worker para de tirar linhas: interrupção ou teto reduzido abaixo dele."""
         return "abort" in token_stats or slot >= current_workers
 
-    async def worker(slot: int, pbar: tqdm) -> None:
+    async def worker(slot: int, pbar: _ProgressBar) -> None:
         """Tira linhas da fila até ela acabar ou o worker parar.
 
         A redução por rate limit não corta a linha em voo: o worker acima do
@@ -5018,24 +5720,27 @@ async def _aprocess_rows(  # noqa: C901, PLR0913, PLR0915 (estado da execução 
                 return
             position, (idx, row) = item
             await run_row(position, idx, row)
-            pbar.update(1)
+            pbar.update()
 
-    def save_on_interrupt() -> None:
+    def save_on_exception() -> None:
         """Grava as linhas registradas e as marcas que a última gravação não levou."""
         ledger.save(also=bool(token_stats.get("abort")) or ledger.marked)
 
-    with _on_ctrl_c(
-        ledger.mark_on_interrupt,
-        save_on_interrupt,
-        (KeyboardInterrupt, asyncio.CancelledError),
+    # Como nos laços de dataframeit: a exceção que sai do laço, também o
+    # cancelamento da tarefa (asyncio.CancelledError), marca as linhas não
+    # registradas e grava o checkpoint antes de sair; ver _on_exception. A
+    # barra fecha depois das marcas e de toda gravação (_ProgressBar), e não
+    # abre a thread de monitoramento do tqdm (_NoMonitorTqdm).
+    with (
+        _ProgressBar(total=sum(to_process), desc=desc, bar_class=_NoMonitorTqdm) as pbar,
+        _on_exception(ledger.mark_on_exception, save_on_exception),
     ):
-        with _NoMonitorTqdm(total=sum(to_process), desc=desc) as pbar:
-            if parallel:
-                await asyncio.gather(*(worker(slot, pbar) for slot in range(parallel_requests)))
-            else:
-                # Na própria tarefa de adataframeit: os avisos da linha apontam a
-                # chamada do usuário, como no modo sequencial de dataframeit.
-                await worker(0, pbar)
+        if parallel:
+            await asyncio.gather(*(worker(slot, pbar) for slot in range(parallel_requests)))
+        else:
+            # Na própria tarefa de adataframeit: os avisos da linha apontam a
+            # chamada do usuário, como no modo sequencial de dataframeit.
+            await worker(0, pbar)
         aborted = "abort" in token_stats
         if aborted:
             ledger.mark()

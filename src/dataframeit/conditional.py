@@ -83,7 +83,7 @@ def _get_field_config(extra: dict[str, Any]) -> FieldConfig:
         "search_depth": extra.get("search_depth"),
         "max_results": extra.get("max_results"),
         "max_search_calls": extra.get("max_search_calls"),
-        "depends_on": extra.get("depends_on", []),
+        "depends_on": extra.get("depends_on"),
         "condition": extra.get("condition"),
     }
 
@@ -167,7 +167,9 @@ def field_condition(
     # cast é o que deixa o Field aceitar o dict no checker de tipos. A função
     # não chega ao schema enviado ao LLM, porque agent._llm_field tira
     # `condition` e `depends_on` do campo antes de montá-lo.
-    return cast("JsonDict", {"condition": condition, "depends_on": names})
+    extra = {"condition": condition, "depends_on": names}
+    # O cast não age em tempo de execução, e o teste de mutação troca o tipo à toa.
+    return cast("JsonDict", extra)  # pragma: no mutate
 
 
 def _collect_configured_fields(
@@ -299,7 +301,9 @@ def _by_value(value: object) -> object:
     value = _json_default(value)
     if isinstance(value, dict):
         return {key: _by_value(item) for key, item in value.items()}
-    return [_by_value(item) for item in cast("list[Any]", value)]
+    # O cast não age em tempo de execução, e o teste de mutação troca o tipo à toa.
+    items = cast("list[Any]", value)  # pragma: no mutate
+    return [_by_value(item) for item in items]
 
 
 def evaluate_condition(  # noqa: PLR0911 (uma saída por forma de condição)
@@ -473,17 +477,19 @@ def detect_circular_dependencies(dependencies: dict[str, list[str]]) -> list[str
             # Um caminho aninhado depende do campo raiz. Quem chama já recusou a
             # dependência inexistente, e todo campo raiz é chave do grafo.
             cycle = dfs(dep.split(".")[0])
-            if cycle:
+            if bool(cycle):
                 return cycle
 
         path.pop()
-        state[field] = _DONE
+        # Sem a marca, que o teste de mutação troca por None, o nó seria
+        # visitado de novo, com o mesmo resultado.
+        state[field] = _DONE  # pragma: no mutate
         return None
 
     for field in dependencies:
         if state[field] == _NOT_VISITED:
             cycle = dfs(field)
-            if cycle:
+            if bool(cycle):
                 return cycle
 
     return None
@@ -508,7 +514,7 @@ def topological_sort(dependencies: dict[str, list[str]]) -> list[str]:
     """
     # Detectar ciclos primeiro
     cycle = detect_circular_dependencies(dependencies)
-    if cycle:
+    if bool(cycle):
         msg = f"Dependências circulares detectadas: {' -> '.join(cycle)}"
         raise ValueError(msg)
 
@@ -717,7 +723,9 @@ def get_group_execution_units(
         ("group", group_name, group_config) for group_name, group_config in groups.items()
     ]
     units += [
-        ("field", field_name, None)
+        # Só o rótulo "group" é comparado, e o teste de mutação troca à toa o
+        # do campo, que serve de leitura.
+        ("field", field_name, None)  # pragma: no mutate
         for field_name in pydantic_model.model_fields
         if field_name not in grouped_fields
     ]
@@ -736,7 +744,7 @@ def get_group_execution_units(
                 unit_dependencies[unit].append(dep_unit)
 
     cycle = detect_circular_dependencies(unit_dependencies)
-    if cycle:
+    if bool(cycle):
         labels = [
             f"grupo '{units[int(key)][1]}'"
             if units[int(key)][0] == "group"

@@ -4,6 +4,7 @@ import json
 import linecache
 import logging
 import math
+import threading
 import typing
 import warnings
 from datetime import UTC, date, datetime, time, timedelta, timezone
@@ -30,6 +31,7 @@ from typing_extensions import TypeAliasType
 
 from dataframeit import ProviderAbortError, ProviderError, core, dataframeit
 from dataframeit.core import _empty_token_stats, _format_token_stats
+from dataframeit.llm import _set_failed_usage
 
 
 class Modelo(BaseModel):
@@ -899,6 +901,38 @@ def test_uso_das_chamadas_feitas_entra_no_resumo_com_a_linha_que_falha(  # noqa:
     assert f"Creditos usados: {2 * chamadas}\n" in saida
 
 
+def test_uso_de_falhas_paralelas_com_a_mesma_excecao_fica_na_linha_certa(caplog):
+    erro_compartilhado = RuntimeError("provider falhou")
+    juntas = threading.Barrier(2)
+
+    def falhar(texto, *_args, **_kwargs):
+        tokens = 10 if texto == "a" else 20
+        _set_failed_usage(erro_compartilhado, {"input_tokens": tokens, "total_tokens": tokens})
+        juntas.wait(timeout=5)
+        raise erro_compartilhado
+
+    with (
+        patch("dataframeit.agent.call_agent", side_effect=falhar),
+        patch("dataframeit.core.validate_provider_dependencies"),
+        patch("dataframeit.core.validate_search_dependencies"),
+        caplog.at_level(logging.INFO, logger="dataframeit.stats"),
+        warnings.catch_warnings(),
+    ):
+        warnings.simplefilter("ignore")
+        resultado = dataframeit(
+            pd.DataFrame({"texto": ["a", "b"]}),
+            questions=Modelo,
+            prompt="{texto}",
+            use_search=True,
+            search_per_field=True,
+            max_retries=1,
+            parallel_requests=2,
+        )
+
+    assert resultado["_dataframeit_status"].tolist() == ["error", "error"]
+    assert "Total de tokens: 30\n" in caplog.text
+
+
 class ModeloQueValidaODefault(BaseModel):
     model_config = ConfigDict(validate_default=True)
 
@@ -975,6 +1009,76 @@ def test_excecao_do_validador_na_linha_montada_fica_no_erro_da_linha():
     assert resultado["_error_details"].tolist() == [
         "[Erro não-recuperável] ProviderOutputError: Linha recusada pelo modelo: KeyError: 'valor'"
     ]
+
+
+class ModeloComSerializadorPorValor(BaseModel):
+    categoria: str
+    nota: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _sem_nota_secreta(self, handler):
+        dados = handler(self)
+        if dados.get("nota") == "secreta":
+            del dados["nota"]
+        return dados
+
+
+@pytest.mark.parametrize("por_campo", [False, True])
+@pytest.mark.parametrize(("nota", "gravada"), [("secreta", "anterior"), ("pública", "pública")])
+def test_campo_que_o_model_serializer_tira_so_com_alguns_valores_segue_o_dump(
+    por_campo, nota, gravada
+):
+    """O modo por campo grava o dump da linha validada, como o modo simples."""
+    entrada = pd.DataFrame(
+        {
+            "texto": ["a"],
+            "categoria": ["velha"],
+            "nota": ["anterior"],
+            "_dataframeit_status": ["processed"],
+        }
+    )
+
+    resultado = _rodar_com_dump(
+        entrada,
+        ModeloComSerializadorPorValor,
+        {"categoria": "nova", "nota": nota},
+        por_campo=por_campo,
+        reprocess_columns=["categoria", "nota"],
+    )
+
+    assert resultado["nota"].tolist() == [gravada]
+
+
+class ModeloComPuladoQueOExcludeIfTiraria(BaseModel):
+    categoria: str
+    obs: str | None = Field(
+        None,
+        exclude_if=lambda valor: valor is None,
+        json_schema_extra={"condition": {"field": "categoria", "equals": "com obs"}},
+    )
+
+
+def test_campo_pulado_pela_condicao_e_gravado_none_mesmo_com_exclude_if():
+    """A condição decide: o exclude_if não é chamado com o None do campo pulado."""
+    entrada = pd.DataFrame(
+        {
+            "texto": ["a"],
+            "categoria": ["com obs"],
+            "obs": ["anterior"],
+            "_dataframeit_status": ["processed"],
+        }
+    )
+
+    resultado = _rodar_com_dump(
+        entrada,
+        ModeloComPuladoQueOExcludeIfTiraria,
+        {"categoria": "sem obs", "obs": "não pedida"},
+        por_campo=True,
+        reprocess_columns=["categoria", "obs"],
+    )
+
+    assert resultado["categoria"].tolist() == ["sem obs"]
+    assert resultado["obs"].tolist() == [None]
 
 
 class ModeloComExcludeIfDoValidado(BaseModel):
@@ -1653,9 +1757,11 @@ def test_resume_false_sem_coluna_de_status_processa_a_coluna_vazia_do_modelo():
 def test_resume_false_com_coluna_de_status_e_colunas_do_modelo_avisa_e_devolve():
     df = pd.DataFrame({"texto": ["a"], "x": [None], "_dataframeit_status": ["error"]})
 
-    with pytest.warns(UserWarning, match=r"Colunas \['x'\] já existem"):
+    with pytest.warns(UserWarning, match=r"Colunas \['x'\] já existem") as avisos:
         resultado, call_langchain = _rodar(df, resume=False)
 
+    assert avisos[0].filename == __file__
+    assert "dataframeit(" in linecache.getline(avisos[0].filename, avisos[0].lineno)
     call_langchain.assert_not_called()
     assert resultado["_dataframeit_status"].tolist() == ["error"]
 

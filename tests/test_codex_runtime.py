@@ -9,6 +9,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import warnings
@@ -39,6 +40,7 @@ _REVIEWED_ENABLED_FEATURES = frozenset(
     {
         "api_key_model_discovery",
         "auth_elicitation",
+        "bedrock_setup_wizard",
         "browser_annotation_api",
         "browser_use_external",
         "browser_use_full_cdp_access",
@@ -47,6 +49,7 @@ _REVIEWED_ENABLED_FEATURES = frozenset(
         "compaction_image_budget",
         "content_item_kinds",
         "daemon_auto_start",
+        "deferred_tool_world_state",
         "enable_request_compression",
         "fast_mode",
         "guardian_approval",
@@ -63,7 +66,10 @@ _REVIEWED_ENABLED_FEATURES = frozenset(
         # turno por outro caminho.
         "instant_interrupt",
         "item_ids",
+        "mcp_oauth_refresh_coordination",
         "mentions_v2",
+        "plugin_discovery_prefetch",
+        "prediction_preserve_parent_tools",
         "plugin_sharing",
         "realtime_conversation",
         "resize_all_images",
@@ -284,8 +290,20 @@ class _Answer(BaseModel):
     resposta: str
 
 
-def _use_local_model_provider(
-    monkeypatch, tmp_path, base_url, model="gpt-6-luna", overrides=_CODEX_CONFIG_OVERRIDES
+def _without_override(override):
+    """Os overrides do provider sem `override`, que precisa estar entre eles."""
+    assert override in _CODEX_CONFIG_OVERRIDES
+    return tuple(item for item in _CODEX_CONFIG_OVERRIDES if item != override)
+
+
+def _use_local_model_provider(  # noqa: PLR0913 (cada argumento troca uma parte do cenário)
+    monkeypatch,
+    tmp_path,
+    base_url,
+    model="gpt-6-luna",
+    overrides=_CODEX_CONFIG_OVERRIDES,
+    *,
+    openai=False,
 ):
     """Aponta o provider para um endpoint de modelo local, sem conta nem rede.
 
@@ -293,7 +311,12 @@ def _use_local_model_provider(
     abertura do backend é a mesma do provider. O runtime manda o request pelo
     proxy do ambiente mesmo para `127.0.0.1`, e um proxy herdado prenderia o
     turno; por isso as variáveis de proxy saem do ambiente. `overrides` troca os
-    overrides do provider, para o teste que precisa de uma ferramenta oferecida.
+    overrides do provider, para o teste que precisa de uma flag ligada.
+
+    Com `openai`, o endpoint é o do provider OpenAI embutido no runtime, com uma
+    chave de API fictícia no `auth.json`: é o provider dos turnos de verdade, o
+    runtime tem ramos que o provider `mock` não alcança e não deixa redefinir o
+    embutido em `model_providers`.
     """
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
         monkeypatch.delenv(name, raising=False)
@@ -305,18 +328,19 @@ def _use_local_model_provider(
     # `model_catalog_json` que o provider passa ao app-server.
     source_home = tmp_path / "códex 😀"
     source_home.mkdir()
-    (source_home / "auth.json").write_text("{}")
     monkeypatch.setenv("CODEX_HOME", os.fspath(source_home))
-    monkeypatch.setenv("DATAFRAMEIT_MOCK_KEY", "local")
-    provider = (
-        f'{{name="mock",base_url="{base_url}",wire_api="responses",'
-        'env_key="DATAFRAMEIT_MOCK_KEY",request_max_retries=0,stream_max_retries=0}'
-    )
-    monkeypatch.setattr(
-        codex_provider,
-        "_CODEX_CONFIG_OVERRIDES",
-        (*overrides, 'model_provider="mock"', f"model_providers.mock={provider}"),
-    )
+    if openai:
+        (source_home / "auth.json").write_text('{"OPENAI_API_KEY": "local"}')
+        endpoint = (f'openai_base_url="{base_url}"',)
+    else:
+        (source_home / "auth.json").write_text("{}")
+        monkeypatch.setenv("DATAFRAMEIT_MOCK_KEY", "local")
+        provider = (
+            f'{{name="mock",base_url="{base_url}",wire_api="responses",'
+            'env_key="DATAFRAMEIT_MOCK_KEY",request_max_retries=0,stream_max_retries=0}'
+        )
+        endpoint = ('model_provider="mock"', f"model_providers.mock={provider}")
+    monkeypatch.setattr(codex_provider, "_CODEX_CONFIG_OVERRIDES", (*overrides, *endpoint))
     return LLMConfig(
         model=model,
         provider="codex",
@@ -346,16 +370,22 @@ def _bundled_models(tmp_path):
     return json.loads(listing.stdout)["models"]
 
 
-def _request_to_model(tmp_path, monkeypatch, slug, overrides=_CODEX_CONFIG_OVERRIDES):
+def _request_to_model(
+    tmp_path, monkeypatch, slug, overrides=_CODEX_CONFIG_OVERRIDES, *, openai=False
+):
     """Corpo, em bytes, do primeiro request que uma linha manda ao modelo `slug`."""
-    run_path = tmp_path / slug
-    run_path.mkdir()
+    run_path = Path(tempfile.mkdtemp(prefix=f"{slug}-", dir=tmp_path))
     handler = type("Handler", (_RecordingProvider,), {"bodies": []})
     server = HTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
     config = _use_local_model_provider(
-        monkeypatch, run_path, f"http://127.0.0.1:{port}/v1", model=slug, overrides=overrides
+        monkeypatch,
+        run_path,
+        f"http://127.0.0.1:{port}/v1",
+        model=slug,
+        overrides=overrides,
+        openai=openai,
     )
 
     try:
@@ -377,6 +407,28 @@ def _request_to_model(tmp_path, monkeypatch, slug, overrides=_CODEX_CONFIG_OVERR
     return raw
 
 
+def _one_model_per_request_shape(tmp_path):
+    """Um modelo do catálogo embutido para cada forma de request.
+
+    Com `use_responses_lite`, as ferramentas vão num item `additional_tools` do
+    `input`; sem, na chave `tools` do topo.
+    """
+    one_per_shape = {}
+    for model in _bundled_models(tmp_path):
+        one_per_shape.setdefault(bool(model.get("use_responses_lite")), model["slug"])
+    # Sem modelo de uma das formas no catálogo embutido, ela fica sem medida.
+    assert set(one_per_shape) == {True, False}
+    return list(one_per_shape.values())
+
+
+def _assert_only_reviewed_tools(raw, slug):
+    assert _offered_tools(_tool_lists(json.loads(raw), [])) == _REVIEWED_MODEL_TOOLS, slug
+    # O nome da ferramenta de sub-agente não aparece em parte alguma do corpo.
+    # `collaboration` não serve para essa busca, porque aparece no texto das
+    # instruções.
+    assert b"spawn_agent" not in raw, slug
+
+
 def test_request_to_model_offers_only_reviewed_tools(tmp_path, monkeypatch):
     """O request de uma linha oferece ao modelo só as ferramentas revisadas.
 
@@ -394,12 +446,7 @@ def test_request_to_model_offers_only_reviewed_tools(tmp_path, monkeypatch):
     slugs = [model["slug"] for model in _bundled_models(tmp_path)]
     assert slugs
     for slug in slugs:
-        raw = _request_to_model(tmp_path, monkeypatch, slug)
-        assert _offered_tools(_tool_lists(json.loads(raw), [])) == _REVIEWED_MODEL_TOOLS, slug
-        # O nome da ferramenta de sub-agente não aparece em parte alguma do corpo.
-        # `collaboration` não serve para essa busca, porque aparece no texto das
-        # instruções.
-        assert b"spawn_agent" not in raw, slug
+        _assert_only_reviewed_tools(_request_to_model(tmp_path, monkeypatch, slug), slug)
 
 
 def test_tool_lists_find_tool_offered_by_runtime(tmp_path, monkeypatch):
@@ -408,19 +455,98 @@ def test_tool_lists_find_tool_offered_by_runtime(tmp_path, monkeypatch):
     Sem este controle, a igualdade com o conjunto revisado, vazio, passaria
     também se o runtime mudasse o lugar onde põe as ferramentas. O controle
     tira o override de `view_image`, que oferece uma ferramenta, e roda um
-    modelo de cada forma de request: com `use_responses_lite`, as ferramentas
-    vão num item `additional_tools` do `input`; sem, na chave `tools` do topo.
+    modelo de cada forma de request.
     """
-    view_image = "features.view_image=false"
-    assert view_image in _CODEX_CONFIG_OVERRIDES
-    overrides = tuple(item for item in _CODEX_CONFIG_OVERRIDES if item != view_image)
-    one_per_shape = {}
-    for model in _bundled_models(tmp_path):
-        one_per_shape.setdefault(bool(model.get("use_responses_lite")), model["slug"])
-    assert one_per_shape
-    for slug in one_per_shape.values():
+    overrides = _without_override("features.view_image=false")
+    for slug in _one_model_per_request_shape(tmp_path):
         raw = _request_to_model(tmp_path, monkeypatch, slug, overrides=overrides)
         assert "view_image" in _offered_tools(_tool_lists(json.loads(raw), [])), slug
+
+
+def _repeated_messages(raw):
+    """Quantas mensagens do `input` repetem o conteúdo de outra."""
+    messages = [
+        json.dumps(item["content"], sort_keys=True)
+        for item in json.loads(raw)["input"]
+        if item.get("type") == "message"
+    ]
+    assert messages
+    return len(messages) - len(set(messages))
+
+
+def test_request_to_model_sends_each_message_once(tmp_path, monkeypatch):
+    """Nenhuma mensagem do `input` vai repetida ao modelo.
+
+    Com `incremental_tools` ligada e nenhuma ferramenta a oferecer, o runtime
+    manda as instruções base duas vezes aos modelos com `use_responses_lite`.
+    O segundo request, com a flag ligada, confere que o override ainda faz
+    diferença no runtime fixado.
+    """
+    slug = next(
+        model["slug"] for model in _bundled_models(tmp_path) if model.get("use_responses_lite")
+    )
+
+    assert _repeated_messages(_request_to_model(tmp_path, monkeypatch, slug)) == 0
+
+    flag_on = _without_override("features.incremental_tools=false")
+    assert _repeated_messages(_request_to_model(tmp_path, monkeypatch, slug, overrides=flag_on)), (
+        "O runtime fixado manda cada mensagem uma vez também com `incremental_tools` "
+        "ligada: confira o que a flag faz agora e, se ela não muda mais o request, tire "
+        "`features.incremental_tools=false` de `_CODEX_CONFIG_OVERRIDES`, ponha a flag em "
+        "`_REVIEWED_ENABLED_FEATURES` e tire este segundo request."
+    )
+
+
+def _configuration_updates(raw):
+    return [item for item in json.loads(raw)["input"] if item.get("type") == "configuration_update"]
+
+
+def test_request_ao_provider_openai_nao_repete_o_effort_em_configuration_update(
+    tmp_path, monkeypatch
+):
+    """O `input` que vai ao provider OpenAI não traz item `configuration_update`.
+
+    Com `reasoning_effort_override` ligada, o runtime repete nesse item o effort
+    que o request já leva em `reasoning`, mas só com o provider OpenAI e modelo
+    com `supports_reasoning_effort_updates`; o provider `mock` dos outros
+    testes não passa por esse ramo. O segundo request, com a flag
+    ligada, confere que o teste alcança o ramo e que o override ainda faz
+    diferença no runtime fixado.
+    """
+    slug = next(
+        model["slug"]
+        for model in _bundled_models(tmp_path)
+        if model.get("supports_reasoning_effort_updates")
+    )
+
+    raw = _request_to_model(tmp_path, monkeypatch, slug, openai=True)
+    assert _configuration_updates(raw) == []
+
+    flag_on = _without_override("features.reasoning_effort_override=false")
+    raw = _request_to_model(tmp_path, monkeypatch, slug, overrides=flag_on, openai=True)
+    assert _configuration_updates(raw), (
+        "O runtime fixado não manda mais `configuration_update` com "
+        "`reasoning_effort_override` ligada: confira o que a flag faz agora e, se ela não "
+        "muda mais o request, tire `features.reasoning_effort_override=false` de "
+        "`_CODEX_CONFIG_OVERRIDES`, ponha a flag em `_REVIEWED_ENABLED_FEATURES` e tire "
+        "este segundo request."
+    )
+
+
+def test_request_ao_provider_openai_oferece_so_ferramentas_revisadas_e_nao_repete_mensagem(
+    tmp_path, monkeypatch
+):
+    """Pelo provider OpenAI embutido, o request também sai sem ferramenta nem repetição.
+
+    É o provider dos turnos de verdade, e os testes das ferramentas e das
+    mensagens repetidas rodam com o `mock`. Cada request pelo embutido leva
+    alguns segundos, porque o runtime tenta o WebSocket antes de cair no HTTP;
+    por isso roda um modelo de cada forma de request, e não o catálogo todo.
+    """
+    for slug in _one_model_per_request_shape(tmp_path):
+        raw = _request_to_model(tmp_path, monkeypatch, slug, openai=True)
+        _assert_only_reviewed_tools(raw, slug)
+        assert _repeated_messages(raw) == 0, slug
 
 
 def _pipes_fechados(processo):

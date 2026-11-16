@@ -7,6 +7,7 @@ import importlib.util
 import pickle
 import tomllib
 import unicodedata
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -234,6 +235,39 @@ def test_cota_esgotada_da_openai_interrompe_sem_nova_tentativa():
 
     assert len(chamadas) == 1
     assert levantado.value.__cause__ is erro
+
+
+@pytest.mark.parametrize(
+    ("factory", "expected", "attempts"),
+    [
+        (lambda: ProviderAbortError("parada"), ProviderAbortError, 1),
+        (_cota_esgotada_da_openai, ProviderUsageLimitError, 1),
+        (lambda: ProviderError("final"), ProviderError, 1),
+        (lambda: ProviderTransientError("transitório"), ProviderTransientError, 2),
+    ],
+)
+def test_gancho_recebe_excecao_terminal_uma_vez(factory, expected, attempts):
+    original = factory()
+    calls = []
+    received = []
+
+    def fail():
+        calls.append(1)
+        raise original
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(expected) as raised:
+            retry_with_backoff(
+                fail,
+                max_retries=2,
+                base_delay=0,
+                max_delay=0,
+                on_failure=received.append,
+            )
+
+    assert len(calls) == attempts
+    assert received == [raised.value]
 
 
 def _embrulhada(causa):
@@ -626,6 +660,30 @@ def test_codex_repete_os_mesmos_status_que_o_langchain(status):
     assert erro.value.status_code == status
     esperado = is_recoverable_error(_ErroDeSdk("falhou", status))
     assert is_recoverable_error(erro.value) is esperado
+
+
+@pytest.mark.parametrize("status", [-401, 0, 200, 600])
+def test_status_fora_da_faixa_http_e_ausente_nos_backends(status):
+    gerado = pytest.importorskip("openai_codex.generated.v2_all")
+    from dataframeit.codex import _raise_turn_error  # noqa: PLC0415 (extra codex opcional)
+
+    erro_claude = _erro_do_claude_code(status)
+    turno = gerado.TurnError(
+        message="falhou",
+        codexErrorInfo=gerado.CodexErrorInfo(
+            root=gerado.HttpConnectionFailedCodexErrorInfo(
+                httpConnectionFailed=gerado.HttpConnectionFailed.model_construct(
+                    http_status_code=status
+                )
+            )
+        ),
+    )
+    with pytest.raises(ProviderError) as erro_codex:
+        _raise_turn_error(turno)
+
+    for erro in (erro_claude, erro_codex.value):
+        assert type(erro) is ProviderTransientError
+        assert erro.status_code is None
 
 
 # =============================================================================

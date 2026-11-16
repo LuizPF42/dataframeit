@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from pydantic import BaseModel, ValidationError, create_model
+from typing_extensions import override
 
 from .conditional import (
     _CONDITIONAL_KEYS,
@@ -28,7 +29,13 @@ from .conditional import (
     should_skip_field,
     topological_sort,
 )
-from .errors import ProviderOutputError, retry_with_backoff, validation_error_summary
+from .errors import (
+    ProviderAbortError,
+    ProviderOutputError,
+    dump_response,
+    retry_with_backoff,
+    validation_error_summary,
+)
 from .llm import (
     _USAGE_COUNTERS,
     LLMConfig,
@@ -36,7 +43,11 @@ from .llm import (
     SearchGroupConfig,
     Usage,
     _BuildOnce,
+    _clear_failed_usage,
     _parse_usage_metadata,
+    _ParserUsageCapture,
+    _set_failed_usage,
+    _take_failed_usage,
     build_prompt,
     chat_model,
 )
@@ -51,6 +62,8 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
+    from uuid import UUID
+
     from langchain_core.runnables import Runnable
     from pydantic.fields import FieldInfo
 
@@ -58,6 +71,33 @@ if TYPE_CHECKING:
     from .search import SearchProvider
 
 logger = logging.getLogger(__name__)
+
+
+class _AgentUsageCapture(_ParserUsageCapture):
+    """Uso de chamadas terminadas antes de o agente levantar uma exceção."""
+
+    def __init__(self, search_tool_name: str) -> None:
+        super().__init__()
+        self.search_tool_name = search_tool_name
+        self._tool_runs: set[UUID] = set()
+        self.search_count = 0
+
+    @override
+    def on_tool_start(
+        self, serialized: dict[str, Any], input_str: str, *, run_id: UUID, **kwargs: Any
+    ) -> None:
+        del input_str
+        if serialized.get("name") == self.search_tool_name:
+            with self._lock:
+                self._tool_runs.add(run_id)
+
+    @override
+    def on_tool_end(self, output: object, *, run_id: UUID, **kwargs: Any) -> None:
+        del output
+        with self._lock:
+            if run_id in self._tool_runs:
+                self._tool_runs.remove(run_id)
+                self.search_count += 1
 
 
 def _empty_usage() -> Usage:
@@ -174,16 +214,16 @@ def _build_field_prompt(
     prompt_replace = field_config.get("prompt")
     prompt_append = field_config.get("prompt_append")
 
-    if prompt_replace:
+    if bool(prompt_replace):
         # Substitui o prompt do usuário, que é quem levava o {texto}
         return _with_text_placeholder(prompt_replace)
 
     # Base: prompt original + instrução do campo
     base_prompt = f"{user_prompt}\n\nResponda APENAS o campo: {field_name}"
-    if field_description:
+    if bool(field_description):
         base_prompt += f" ({field_description})"
 
-    if prompt_append:
+    if bool(prompt_append):
         # Adiciona texto customizado
         base_prompt += f"\n\n{prompt_append}"
 
@@ -302,7 +342,7 @@ def _enrich_list_items_with_search(  # noqa: PLR0913, PLR0917 (laço por item e 
         Tupla (enriched_items, traces).
     """
     enriched_items = []
-    traces = [] if save_trace else None
+    traces = [] if bool(save_trace) else None
 
     for item_idx, item in enumerate(list_items or []):
         # A resposta do agente passa por model_dump, e cada item de List[Model]
@@ -313,7 +353,7 @@ def _enrich_list_items_with_search(  # noqa: PLR0913, PLR0917 (laço por item e 
             continue
         item_dict = item.copy()
 
-        item_traces = {} if save_trace else None
+        item_traces = {} if bool(save_trace) else None
 
         # Construir contexto do item para a busca
         item_context = _build_item_context(item_dict, inner_model)
@@ -357,7 +397,7 @@ def _enrich_list_items_with_search(  # noqa: PLR0913, PLR0917 (laço por item e 
 
         enriched_items.append(item_dict)
 
-        if traces is not None and item_traces:
+        if traces is not None and bool(item_traces):
             traces.append(item_traces)
 
     return enriched_items, traces
@@ -491,17 +531,44 @@ def call_agent(  # noqa: PLR0913, PLR0917 (assinatura comum aos modos de busca, 
     else:
         built = build_search_agent(pydantic_model, config)
     agent, provider, tool_name = built.agent, built.provider, built.tool_name
+    usage_total: Usage = {}
 
     def _call() -> dict[str, Any]:
         prompt = build_prompt(user_prompt, text)
 
         # Medir tempo de execução
         start_time = time.perf_counter()
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": prompt}]},
-            config={"recursion_limit": _recursion_limit(search_config.max_search_calls)},
-        )
+        capture = _AgentUsageCapture(tool_name)
+        try:
+            result = agent.invoke(
+                {"messages": [{"role": "user", "content": prompt}]},
+                config={
+                    "recursion_limit": _recursion_limit(search_config.max_search_calls),
+                    "callbacks": [capture],
+                },
+            )
+        except Exception:
+            # O agente não devolve as mensagens já cobradas quando uma ferramenta
+            # ou o modelo levanta. O callback recebeu as chamadas concluídas.
+            _add_usage(usage_total, capture.usage)
+            if capture.search_count:
+                usage_total["search_count"] = (
+                    usage_total.get("search_count", 0) + capture.search_count
+                )
+                search_credits = provider.calculate_credits(
+                    search_count=capture.search_count,
+                    search_depth=search_config.search_depth,
+                    max_results=search_config.max_results,
+                )
+                usage_total["search_credits"] = (
+                    usage_total.get("search_credits", 0) + search_credits
+                )
+            raise
         duration = time.perf_counter() - start_time
+
+        # A tentativa consumiu tokens e créditos mesmo sem resposta estruturada.
+        usage = _extract_usage(result, provider, search_config, tool_name)
+        _add_usage(usage_total, usage)
 
         # Extrair resposta estruturada
         structured = result.get("structured_response")
@@ -509,26 +576,29 @@ def call_agent(  # noqa: PLR0913, PLR0917 (assinatura comum aos modos de busca, 
             msg = "Agente não retornou resposta estruturada"
             raise ValueError(msg)
 
-        data = (
-            structured.model_dump(by_alias=False)
-            if hasattr(structured, "model_dump")
-            else structured
-        )
+        data = dump_response(structured) if hasattr(structured, "model_dump") else structured
 
-        # Calcular usage (tokens + search credits via provider)
-        usage = _extract_usage(result, provider, search_config, tool_name)
-
-        response = {"data": data, "usage": usage}
+        response = {"data": data, "usage": {**usage_total, "search_provider": provider.name}}
 
         # Extrair trace se habilitado
-        if save_trace:
+        if bool(save_trace):
             response["trace"] = _extract_trace(
                 result, config.model, duration, save_trace, provider, tool_name
             )
 
         return response
 
-    return retry_with_backoff(_call, config.max_retries, config.base_delay, config.max_delay)
+    def _on_failure(error: Exception) -> None:
+        error.row_usage = usage_total  # ty: ignore[unresolved-attribute]
+        _set_failed_usage(error, usage_total)
+
+    return retry_with_backoff(
+        _call,
+        config.max_retries,
+        config.base_delay,
+        config.max_delay,
+        on_failure=_on_failure,
+    )
 
 
 def _run_nested_searches(
@@ -552,7 +622,7 @@ def _run_nested_searches(
         search_context mapeia path -> resultado da busca.
     """
     search_context = {}
-    traces = {} if save_trace else None
+    traces = {} if bool(save_trace) else None
 
     for path, field_name, field_info, parent_model, _ in nested_fields:
         # Extrair configurações do campo
@@ -675,7 +745,8 @@ class _FieldExtractor:
     def __call__(
         self, text: str, only_fields: set[str] | None = None, known: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        row = _Row(text, only_fields, known or {}, traces={} if self.save_trace else None)
+        _clear_failed_usage()
+        row = _Row(text, only_fields, known or {}, traces={} if bool(self.save_trace) else None)
         try:
             self._search_nested_fields(row)
             for unit in self.units:
@@ -685,13 +756,17 @@ class _FieldExtractor:
         except Exception as error:
             # A linha falhou, mas as chamadas já feitas foram cobradas; o core
             # soma esse uso ao resumo. Atributo dinâmico, lido com getattr.
+            failed = _take_failed_usage(error)
+            if failed is not None:
+                _add_usage(row.usage, failed.usage)
+            _set_failed_usage(error, row.usage, failed.cost_usd if failed is not None else 0)
             error.row_usage = row.usage  # ty: ignore[unresolved-attribute]
             raise
         response = {
             "data": data,
             "usage": {**row.usage, "search_provider": _search_config(self.config).provider},
         }
-        if self.save_trace:
+        if bool(self.save_trace):
             response["traces"] = row.traces
         return response
 
@@ -718,10 +793,10 @@ class _FieldExtractor:
             for name in self.pydantic_model.model_fields
             if name not in skipped and name not in hidden
         }
-        dumped = (
-            _skipping_model(self.pydantic_model, skipped, hidden)
-            .model_validate(values, strict=False, by_alias=False, by_name=True)
-            .model_dump(by_alias=False)
+        dumped = dump_response(
+            _skipping_model(self.pydantic_model, skipped, hidden).model_validate(
+                values, strict=False, by_alias=False, by_name=True
+            )
         )
         return values, dumped
 
@@ -732,13 +807,18 @@ class _FieldExtractor:
         e o validado que o dump da linha tira, como pelo exclude_if do valor
         validado, sai da resposta. A linha recusada levanta
         ProviderOutputError, com o caminho e a regra de cada erro, ou com a
-        exceção que o validador levantou.
+        exceção que o validador levantou; o ProviderAbortError do dump segue
+        como veio.
         """
         try:
             values, dumped = self._validate_row(row)
         except ValidationError as error:
             msg = f"Linha recusada pelo modelo: {validation_error_summary(error)}"
             raise ProviderOutputError(msg) from error
+        except ProviderAbortError:
+            # O dump que cai com a resposta deste modelo cai em toda linha
+            # (`dump_response`), e a execução para, como nos outros modos.
+            raise
         except Exception as error:
             msg = f"Linha recusada pelo modelo: {type(error).__name__}: {error}"
             raise ProviderOutputError(msg) from error
@@ -855,6 +935,10 @@ class _FieldExtractor:
             return
         try:
             _, dumped = self._validate_row(row)
+        except ProviderAbortError:
+            # O dump que cai aqui cai em toda linha: a execução para antes das
+            # chamadas que faltam nesta (`_validated_data`).
+            raise
         except Exception:  # noqa: BLE001 (o validador e o serializador são do usuário)
             return
         for name in inputs:
@@ -900,7 +984,7 @@ class _FieldExtractor:
                 for name in active
             },
         )
-        if group.prompt:
+        if bool(group.prompt):
             # {query} é sinônimo de {texto} no prompt de grupo
             prompt = _with_text_placeholder(group.prompt.replace("{query}", "{texto}"))
         else:
@@ -961,8 +1045,8 @@ def field_extractor(
     Ela devolve 'data' (os campos que o model_dump do modelo traz, na ordem
     do modelo), 'usage' (soma das chamadas, com 'search_provider') e, com
     save_trace, 'traces', um por grupo, campo, caminho aninhado e lista
-    enriquecida ('{campo}_items'). O campo que o @model_serializer tira só
-    com alguns valores vem como os outros.
+    enriquecida ('{campo}_items'). O campo pulado pela condição vem None,
+    mesmo quando o exclude_if dele tiraria o None do dump.
 
     Raises:
         ValueError: Se há dependências inválidas ou circulares, inclusive entre
